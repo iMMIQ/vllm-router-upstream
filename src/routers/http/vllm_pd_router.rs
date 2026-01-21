@@ -968,6 +968,40 @@ impl VllmPDRouter {
             })
         }
     }
+
+    /// Add a prefill server to the router
+    /// Delegates to the underlying PDRouter
+    pub async fn add_prefill_server(
+        &self,
+        url: String,
+        bootstrap_port: Option<u16>,
+    ) -> Result<String, PDRouterError> {
+        self.pd_router.add_prefill_server(url, bootstrap_port).await
+    }
+
+    /// Add a decode server to the router
+    /// Delegates to the underlying PDRouter
+    pub async fn add_decode_server(&self, url: String) -> Result<String, PDRouterError> {
+        self.pd_router.add_decode_server(url).await
+    }
+
+    /// Remove a prefill server from the router
+    /// Delegates to the underlying PDRouter
+    pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
+        self.pd_router.remove_prefill_server(url).await
+    }
+
+    /// Remove a decode server from the router
+    /// Delegates to the underlying PDRouter
+    pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
+        self.pd_router.remove_decode_server(url).await
+    }
+
+    /// Get a reference to the underlying PDRouter's worker registry
+    /// This allows access to worker information for refresh operations
+    pub fn worker_registry(&self) -> &crate::core::WorkerRegistry {
+        &self.pd_router.worker_registry
+    }
 }
 
 // Delegate most RouterTrait methods to the underlying PDRouter,
