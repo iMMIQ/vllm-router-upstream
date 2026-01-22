@@ -1,38 +1,62 @@
 // vLLM PD (Prefill-Decode) Router Implementation
-// This module extends PDRouter to handle vLLM-specific two-stage processing
+// This module provides a standalone vLLM-specific two-stage processing router
+// with service discovery integration and ZMQ-based KV transfer support
 use super::dp_utils;
 use super::logprobs_merge;
-use super::pd_router::PDRouter;
 use super::pd_types::PDRouterError;
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
-use crate::core::{BasicWorker, Worker, WorkerType};
-use crate::policies::PolicyRegistry;
+use crate::config::types::RetryConfig;
+use crate::core::{
+    BasicWorker, CircuitBreakerConfig, HealthConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType,
+};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use std::time::Duration;
+use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// vLLM PD Router that extends PDRouter with vLLM-specific request handling
+/// vLLM PD Router - standalone router for vLLM prefill-decode disaggregation
 #[derive(Debug)]
 pub struct VllmPDRouter {
-    /// Underlying PD router for most functionality
-    pd_router: PDRouter,
+    /// Worker registry for prefill/decode workers
+    pub worker_registry: Arc<WorkerRegistry>,
+    /// Policy registry for load balancing
+    pub policy_registry: Arc<PolicyRegistry>,
+    /// Worker startup timeout in seconds
+    pub worker_startup_timeout_secs: u64,
+    /// Worker startup check interval in seconds
+    pub worker_startup_check_interval_secs: u64,
+    /// Worker loads for monitoring
+    pub worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
+    /// Handle to the load monitoring task
+    pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+    /// HTTP client for making requests
+    pub client: Client,
+    /// Dedicated client for prefill fire-and-forget requests
+    pub prefill_client: Client,
+    /// Retry configuration
+    pub retry_config: RetryConfig,
+    /// Circuit breaker configuration
+    pub circuit_breaker_config: CircuitBreakerConfig,
+    /// Channel for sending prefill responses to background workers for draining
+    prefill_drain_tx: mpsc::Sender<reqwest::Response>,
     /// Service discovery registry for dynamic ZMQ address resolution
     service_registry: Arc<ServiceRegistry>,
     /// HTTP client for making requests to discovered services
     http_client: reqwest::Client,
-    /// Policy registry for load balancing
-    policy_registry: Arc<PolicyRegistry>,
     /// Whether this router uses service discovery (true) or direct URLs (false)
     use_discovery: bool,
     /// Enable profiling calls to vLLM workers
@@ -80,6 +104,65 @@ impl VllmPDRouter {
         http_address
     }
 
+    /// Private helper method to perform health check on a new server
+    async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
+        crate::routers::http::router::Router::wait_for_healthy_workers(
+            &[url.to_string()],
+            self.worker_startup_timeout_secs,
+            self.worker_startup_check_interval_secs,
+        )
+        .await
+        .map_err(|_| PDRouterError::HealthCheckFailed {
+            url: url.to_string(),
+        })
+    }
+
+    /// Start profiling on a backend server
+    async fn do_start_profiling(&self, worker_url: &str) {
+        // Extract base URL if worker_url is in DP-aware format (e.g., http://127.0.0.1:8081@2)
+        let (base_url, _) = dp_utils::parse_worker_url(worker_url);
+
+        let url = format!("{}/start_profile", base_url);
+        match self.client.post(&url).send().await {
+            Ok(res) if res.status().is_success() => {
+                info!("Started profiling on {}", base_url);
+            }
+            Ok(res) => {
+                warn!(
+                    "Failed to start profiling on {}: status {}",
+                    base_url,
+                    res.status()
+                );
+            }
+            Err(e) => {
+                warn!("Error starting profiling on {}: {}", base_url, e);
+            }
+        }
+    }
+
+    /// Stop profiling on a backend server
+    async fn do_stop_profiling(&self, worker_url: &str) {
+        // Extract base URL if worker_url is in DP-aware format (e.g., http://127.0.0.1:8081@2)
+        let (base_url, _) = dp_utils::parse_worker_url(worker_url);
+
+        let url = format!("{}/stop_profile", base_url);
+        match self.client.post(&url).send().await {
+            Ok(res) if res.status().is_success() => {
+                info!("Stopped profiling on {}", base_url);
+            }
+            Ok(res) => {
+                warn!(
+                    "Failed to stop profiling on {}: status {}",
+                    base_url,
+                    res.status()
+                );
+            }
+            Err(e) => {
+                warn!("Error stopping profiling on {}: {}", base_url, e);
+            }
+        }
+    }
+
     /// Helper: Start profiling on a backend server with timeout
     async fn start_profiling(&self, worker_url: &str) {
         // Only profile if enabled
@@ -88,12 +171,12 @@ impl VllmPDRouter {
         }
 
         // Start profiling on the worker
-        self.pd_router.start_profiling(worker_url).await;
+        self.do_start_profiling(worker_url).await;
 
         // Spawn a timeout task that will call stop_profiling if timeout is reached
         let timeout_secs = self.profile_timeout_secs;
         let worker_url_owned = worker_url.to_string();
-        let pd_router_clone = self.pd_router.clone();
+        let client = self.client.clone();
         let profiling_tasks_clone = self.profiling_tasks.clone();
 
         let task_handle = tokio::spawn(async move {
@@ -103,7 +186,13 @@ impl VllmPDRouter {
                 "Profiling timeout reached for {}, stopping profiling",
                 worker_url_owned
             );
-            pd_router_clone.stop_profiling(&worker_url_owned).await;
+
+            // Stop profiling directly
+            let (base_url, _) = dp_utils::parse_worker_url(&worker_url_owned);
+            let url = format!("{}/stop_profile", base_url);
+            if let Err(e) = client.post(&url).send().await {
+                warn!("Error stopping profiling on {}: {}", base_url, e);
+            }
 
             // Remove ourselves from the tasks map
             let mut tasks = profiling_tasks_clone.lock().await;
@@ -133,7 +222,175 @@ impl VllmPDRouter {
         }
 
         // Stop profiling on the worker
-        self.pd_router.stop_profiling(worker_url).await;
+        self.do_stop_profiling(worker_url).await;
+    }
+
+    /// Generic helper for proxying to a specific worker
+    async fn proxy_to_worker(
+        &self,
+        worker_url: String,
+        endpoint: &str,
+        headers: Option<Vec<(String, String)>>,
+    ) -> Response {
+        // Extract base URL if DP-aware format (e.g., http://127.0.0.1:8081@0 → http://127.0.0.1:8081)
+        let (base_url, _) = dp_utils::parse_worker_url(&worker_url);
+        let url = format!("{}/{}", base_url, endpoint);
+        let mut request_builder = self.client.get(&url);
+
+        // Add headers if provided
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                request_builder = request_builder.header(name, value);
+            }
+        }
+
+        match request_builder.send().await {
+            Ok(res) if res.status().is_success() => {
+                let response_headers = header_utils::preserve_response_headers(res.headers());
+
+                match res.bytes().await {
+                    Ok(body) => {
+                        let mut response = Response::new(axum::body::Body::from(body));
+                        *response.status_mut() = StatusCode::OK;
+                        *response.headers_mut() = response_headers;
+                        response
+                    }
+                    Err(e) => {
+                        error!("Failed to read response body: {}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to read response body: {}", e),
+                        )
+                            .into_response()
+                    }
+                }
+            }
+            Ok(res) => {
+                let status = StatusCode::from_u16(res.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                (status, format!("{} server returned status: ", res.status())).into_response()
+            }
+            Err(e) => {
+                error!("Failed to proxy request server: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to proxy request: {}", e),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    /// Helper for proxying requests to the first prefill worker
+    async fn proxy_to_first_prefill_worker(
+        &self,
+        endpoint: &str,
+        headers: Option<Vec<(String, String)>>,
+    ) -> Response {
+        let workers = self.worker_registry.get_prefill_workers();
+        let first_worker_url = workers.first().map(|w| w.url().to_string());
+
+        if let Some(worker_url) = first_worker_url {
+            self.proxy_to_worker(worker_url, endpoint, headers).await
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No prefill servers available".to_string(),
+            )
+                .into_response()
+        }
+    }
+
+    /// Helper function to select a worker using the policy
+    fn pick_worker_by_policy(
+        workers: &[Arc<dyn Worker>],
+        policy: &dyn LoadBalancingPolicy,
+        request_text: Option<&str>,
+        worker_type: &str,
+    ) -> Result<Arc<dyn Worker>, String> {
+        // Check if we have any workers
+        if workers.is_empty() {
+            return Err(format!(
+                "No {} workers available. Please check if {} servers are configured and healthy.",
+                worker_type, worker_type
+            ));
+        }
+
+        // Filter available workers (healthy + circuit breaker not open)
+        let available_workers: Vec<Arc<dyn Worker>> = workers
+            .iter()
+            .filter(|w| w.is_available())
+            .cloned()
+            .collect();
+
+        if available_workers.is_empty() {
+            return Err(format!(
+                "No available {} workers (all circuits open or unhealthy)",
+                worker_type
+            ));
+        }
+
+        // Let policy select from available workers
+        let selected_idx = policy
+            .select_worker(&available_workers, request_text)
+            .ok_or_else(|| {
+                format!(
+                    "Policy {} failed to select a {} worker",
+                    policy.name(),
+                    worker_type
+                )
+            })?;
+
+        // Return the selected Arc worker
+        Ok(available_workers[selected_idx].clone())
+    }
+
+    /// Select a pair of prefill and decode servers
+    async fn select_pd_pair(
+        &self,
+        request_text: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
+        // Get workers from registry - filter by model if provided
+        let prefill_workers = if let Some(model) = model_id {
+            self.worker_registry
+                .get_by_model_fast(model)
+                .into_iter()
+                .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
+                .collect()
+        } else {
+            self.worker_registry.get_prefill_workers()
+        };
+
+        let decode_workers = if let Some(model) = model_id {
+            self.worker_registry
+                .get_by_model_fast(model)
+                .into_iter()
+                .filter(|w| matches!(w.worker_type(), WorkerType::Decode))
+                .collect()
+        } else {
+            self.worker_registry.get_decode_workers()
+        };
+
+        // Use separate policies for prefill and decode
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+
+        let prefill = Self::pick_worker_by_policy(
+            &prefill_workers,
+            &*prefill_policy,
+            request_text,
+            "prefill",
+        )?;
+
+        let decode = Self::pick_worker_by_policy(
+            &decode_workers,
+            &*decode_policy,
+            request_text,
+            "decode",
+        )?;
+
+        Ok((prefill, decode))
     }
 
     /// Modify request for prefill stage (set max_tokens=1)
@@ -286,6 +543,97 @@ impl VllmPDRouter {
                 debug!("Two-stage processing failed: {}", e);
                 (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Request processing failed: {}", e),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    /// Process vLLM request with direct URLs (non-discovery mode)
+    async fn process_direct_url_request(&self, request_json: Value, path: &str) -> Response {
+        debug!("Processing direct URL vLLM request for path: {}", path);
+
+        // Get prefill and decode workers from worker_registry
+        let prefill_workers = self.worker_registry.get_prefill_workers();
+        let decode_workers = self.worker_registry.get_decode_workers();
+
+        info!(
+            "Found {} prefill workers, {} decode workers from worker_registry",
+            prefill_workers.len(),
+            decode_workers.len()
+        );
+
+        if prefill_workers.is_empty() || decode_workers.is_empty() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "No workers available: {} prefill, {} decode",
+                    prefill_workers.len(),
+                    decode_workers.len()
+                ),
+            )
+                .into_response();
+        }
+
+        // Select workers using policy
+        let request_text = serde_json::to_string(&request_json).ok();
+        let request_str = request_text.as_deref();
+
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+
+        let prefill_idx = match prefill_policy.select_worker(&prefill_workers, request_str) {
+            Some(idx) => idx,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Prefill policy failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
+
+        let decode_idx = match decode_policy.select_worker(&decode_workers, request_str) {
+            Some(idx) => idx,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Decode policy failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
+
+        let prefill_worker = &prefill_workers[prefill_idx];
+        let decode_worker = &decode_workers[decode_idx];
+
+        info!(
+            "Selected prefill={} [policy:{}], decode={} [policy:{}]",
+            prefill_worker.url(),
+            prefill_policy.name(),
+            decode_worker.url(),
+            decode_policy.name()
+        );
+
+        // Execute dual dispatch with vLLM two-stage processing
+        match self
+            .process_vllm_two_stage_request(
+                request_json,
+                prefill_worker.clone(),
+                decode_worker.clone(),
+                path,
+            )
+            .await
+        {
+            Ok(response) => {
+                info!("Two-stage processing completed successfully");
+                response
+            }
+            Err(e) => {
+                info!("Two-stage processing failed: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Request processing failed: {}", e),
                 )
                     .into_response()
@@ -586,12 +934,13 @@ impl VllmPDRouter {
         let request_id = Self::generate_vllm_request_id(&prefill_zmq_addr, &decode_zmq_addr);
 
         debug!("Generated vLLM request ID: {}", request_id);
-        debug!("🔍 vLLM Proxy Comparison:");
-        debug!("  📋 vLLM Proxy Request ID format: ___prefill_addr_{{zmq_addr}}___decode_addr_{{zmq_addr}}_{{uuid}}");
-        debug!("  📋 Our Request ID format: ___prefill_addr_{{http_addr}}___decode_addr_{{http_addr}}_{{uuid}}");
-        debug!("  📋 vLLM Proxy headers: Authorization: Bearer $OPENAI_API_KEY, X-Request-Id: {{request_id}}");
+        debug!("vLLM Proxy Comparison:");
+        debug!("  vLLM Proxy Request ID format: ___prefill_addr_{{zmq_addr}}___decode_addr_{{zmq_addr}}_{{uuid}}");
+        debug!("  Our Request ID format: ___prefill_addr_{{http_addr}}___decode_addr_{{http_addr}}_{{uuid}}");
+        debug!("  vLLM Proxy headers: Authorization: Bearer $OPENAI_API_KEY, X-Request-Id: {{request_id}}");
         debug!(
-            "  📋 Our headers: Authorization: Bearer $OPENAI_API_KEY, X-Request-Id: {{request_id}}"
+            "  Our headers: Authorization=Bearer [REDACTED], X-Request-Id={}",
+            request_id
         );
 
         // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
@@ -631,19 +980,19 @@ impl VllmPDRouter {
         let prefill_url = format!("{}{}", prefill_base_url, path);
 
         debug!(
-            "🚀 vLLM Stage 1 - Prefill: {} with request_id: {}",
+            "vLLM Stage 1 - Prefill: {} with request_id: {}",
             prefill_url, request_id
         );
         if let Some(rank) = prefill_dp_rank {
-            debug!("📤 Prefill request headers: Authorization=Bearer [REDACTED], X-Request-Id={}, X-data-parallel-rank={}", request_id, rank);
+            debug!("Prefill request headers: Authorization=Bearer [REDACTED], X-Request-Id={}, X-data-parallel-rank={}", request_id, rank);
         } else {
             debug!(
-                "📤 Prefill request headers: Authorization=Bearer [REDACTED], X-Request-Id={}",
+                "Prefill request headers: Authorization=Bearer [REDACTED], X-Request-Id={}",
                 request_id
             );
         }
         debug!(
-            "📤 Prefill request payload: {}",
+            "Prefill request payload: {}",
             serde_json::to_string_pretty(&prefill_request).unwrap_or_default()
         );
 
@@ -651,7 +1000,6 @@ impl VllmPDRouter {
         self.start_profiling(&prefill_base_url).await;
 
         let mut prefill_request_builder = self
-            .pd_router
             .client
             .post(&prefill_url)
             .header("Content-Type", "application/json")
@@ -678,9 +1026,9 @@ impl VllmPDRouter {
                 message: format!("Prefill request failed to {}: {}", prefill_url, e),
             })?;
 
-        debug!("📥 Prefill response status: {}", prefill_response.status());
+        debug!("Prefill response status: {}", prefill_response.status());
         debug!(
-            "📥 Prefill response headers: {:?}",
+            "Prefill response headers: {:?}",
             prefill_response.headers()
         );
 
@@ -697,12 +1045,12 @@ impl VllmPDRouter {
                 })?;
 
         debug!(
-            "📥 Prefill response body size: {} bytes",
+            "Prefill response body size: {} bytes",
             prefill_bytes.len()
         );
         if prefill_bytes.len() < 1024 {
             debug!(
-                "📥 Prefill response body content: {}",
+                "Prefill response body content: {}",
                 String::from_utf8_lossy(&prefill_bytes)
             );
         }
@@ -728,7 +1076,7 @@ impl VllmPDRouter {
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
-        debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
+        debug!("vLLM Stage 1 completed, starting Stage 2 - Decode");
 
         // Stage 2: Prepare decode request with kv_transfer_params from prefill response at top level
         let mut decode_request = original_request.clone();
@@ -758,19 +1106,19 @@ impl VllmPDRouter {
         let decode_url = format!("{}{}", decode_base_url, path);
 
         debug!(
-            "🚀 vLLM Stage 2 - Decode: {} with request_id: {}",
+            "vLLM Stage 2 - Decode: {} with request_id: {}",
             decode_url, request_id
         );
         if let Some(rank) = decode_dp_rank {
-            debug!("📤 Decode request headers: Authorization=Bearer [REDACTED], X-Request-Id={}, X-data-parallel-rank={}", request_id, rank);
+            debug!("Decode request headers: Authorization=Bearer [REDACTED], X-Request-Id={}, X-data-parallel-rank={}", request_id, rank);
         } else {
             debug!(
-                "📤 Decode request headers: Authorization=Bearer [REDACTED], X-Request-Id={}",
+                "Decode request headers: Authorization=Bearer [REDACTED], X-Request-Id={}",
                 request_id
             );
         }
         debug!(
-            "📤 Decode request payload: {}",
+            "Decode request payload: {}",
             serde_json::to_string_pretty(&decode_request).unwrap_or_default()
         );
 
@@ -778,7 +1126,6 @@ impl VllmPDRouter {
         self.start_profiling(&decode_base_url).await;
 
         let mut decode_request_builder = self
-            .pd_router
             .client
             .post(&decode_url)
             .header("Content-Type", "application/json")
@@ -811,8 +1158,8 @@ impl VllmPDRouter {
         let status = decode_response.status();
         let headers = decode_response.headers().clone();
 
-        info!("📥 Decode response status: {}", status);
-        info!("📥 Decode response headers: {:?}", headers);
+        info!("Decode response status: {}", status);
+        info!("Decode response headers: {:?}", headers);
 
         // Check if logprobs merging is needed
         let needs_logprobs = original_request.get("logprobs").is_some()
@@ -897,6 +1244,70 @@ impl VllmPDRouter {
         }
     }
 
+    /// Background task to monitor worker loads
+    async fn monitor_worker_loads_with_client(
+        worker_urls: Vec<String>,
+        tx: tokio::sync::watch::Sender<HashMap<String, isize>>,
+        interval_secs: u64,
+        client: Client,
+        prefill_policy: Arc<dyn LoadBalancingPolicy>,
+        decode_policy: Arc<dyn LoadBalancingPolicy>,
+    ) {
+        loop {
+            let mut loads = HashMap::new();
+
+            let futures: Vec<_> = worker_urls
+                .iter()
+                .map(|url| {
+                    let client = client.clone();
+                    let url = url.clone();
+                    async move {
+                        let load = Self::get_worker_load_static(&client, &url).await.unwrap_or(0);
+                        (url, load)
+                    }
+                })
+                .collect();
+
+            let results = futures_util::future::join_all(futures).await;
+
+            for (url, load) in results {
+                loads.insert(url, load);
+            }
+
+            debug!("Worker loads updated: {:?}", loads);
+
+            // Update both policies with current loads
+            prefill_policy.update_loads(&loads);
+            decode_policy.update_loads(&loads);
+
+            // Check if receiver is still active
+            if tx.send(loads).is_err() {
+                info!("Load monitor receiver dropped, shutting down monitor task");
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+        }
+    }
+
+    /// Get worker load (static version for use in async contexts)
+    async fn get_worker_load_static(client: &Client, url: &str) -> Option<isize> {
+        // Extract base URL if DP-aware format
+        let (base_url, _) = dp_utils::parse_worker_url(url);
+        let load_url = format!("{}/load", base_url);
+
+        match client.get(&load_url).send().await {
+            Ok(res) if res.status().is_success() => {
+                if let Ok(text) = res.text().await {
+                    text.trim().parse().ok()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Create a new vLLM PD router
     /// Supports two modes:
     /// 1. Discovery mode: discovery_address is Some, prefill_urls and decode_urls are empty
@@ -907,15 +1318,90 @@ impl VllmPDRouter {
         discovery_address: Option<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
+        let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
+        let core_cb_config = CircuitBreakerConfig {
+            failure_threshold: circuit_breaker_config.failure_threshold,
+            success_threshold: circuit_breaker_config.success_threshold,
+            timeout_duration: Duration::from_secs(circuit_breaker_config.timeout_duration_secs),
+            window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
+        };
+
+        // Build a dedicated prefill client for fire-and-forget semantics
+        let prefill_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .http1_only()
+            .connect_timeout(Duration::from_millis(300))
+            .timeout(Duration::from_secs(ctx.router_config.request_timeout_secs))
+            .build()
+            .map_err(|e| format!("Failed to build prefill client: {}", e))?;
+
+        // Create bounded channel for prefill response draining
+        let (prefill_drain_tx, mut prefill_drain_rx) = mpsc::channel::<reqwest::Response>(2000);
+
+        // Spawn a coordinator with limited concurrent drain tasks
+        tokio::spawn(async move {
+            info!("Prefill drain coordinator started");
+
+            let max_concurrent_drains = 100;
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_drains));
+
+            while let Some(response) = prefill_drain_rx.recv().await {
+                let permit = semaphore.clone().acquire_owned().await;
+
+                match permit {
+                    Ok(permit) => {
+                        tokio::spawn(async move {
+                            use futures_util::StreamExt;
+                            let url = response.url().to_string();
+                            let status = response.status();
+
+                            if !status.is_success() {
+                                error!("Prefill drain: error status={} url={}", status, url);
+                            }
+
+                            let start = std::time::Instant::now();
+                            let mut stream = response.bytes_stream();
+                            let mut bytes_drained = 0;
+
+                            while let Some(chunk_result) = stream.next().await {
+                                match chunk_result {
+                                    Ok(chunk) => bytes_drained += chunk.len(),
+                                    Err(e) => {
+                                        debug!(
+                                            "Prefill drain: error streaming url={} error={}",
+                                            url, e
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+
+                            let elapsed = start.elapsed();
+                            if elapsed > Duration::from_millis(100) {
+                                debug!(
+                                    "Prefill drain: slow drain {} bytes from {} in {:?}",
+                                    bytes_drained, url, elapsed
+                                );
+                            }
+
+                            drop(permit);
+                        });
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+            info!("Prefill drain coordinator shutting down");
+        });
+
         if let Some(ref addr) = discovery_address {
             // Discovery mode
             info!(
                 "VllmPDRouter::new called in discovery mode with address: {}",
                 addr
             );
-
-            // Create underlying PD router with empty worker lists (they'll be discovered dynamically)
-            let pd_router = PDRouter::new(vec![], vec![], ctx).await?;
 
             // Initialize service discovery
             let mut service_registry = ServiceRegistry::new();
@@ -926,13 +1412,26 @@ impl VllmPDRouter {
                 .await
                 .map_err(|e| format!("Failed to start service discovery: {}", e))?;
 
+            // Set up background load monitoring (no workers to monitor in discovery mode)
+            let (_tx, rx) = tokio::sync::watch::channel(HashMap::new());
+            let worker_loads = Arc::new(rx);
+
             info!("VllmPDRouter created successfully with pure service discovery");
 
             Ok(Self {
-                pd_router,
+                worker_registry: Arc::clone(&ctx.worker_registry),
+                policy_registry: Arc::clone(&ctx.policy_registry),
+                worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,
+                worker_startup_check_interval_secs: ctx.router_config.worker_startup_check_interval_secs,
+                worker_loads,
+                load_monitor_handle: None,
+                client: ctx.client.clone(),
+                prefill_client,
+                retry_config: ctx.router_config.effective_retry_config(),
+                circuit_breaker_config: core_cb_config,
+                prefill_drain_tx,
                 service_registry: Arc::new(service_registry),
                 http_client: reqwest::Client::new(),
-                policy_registry: ctx.policy_registry.clone(),
                 use_discovery: true,
                 enable_profiling: ctx.router_config.enable_profiling,
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
@@ -940,15 +1439,142 @@ impl VllmPDRouter {
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
             })
         } else {
-            // Direct URL mode (same as PDRouter)
+            // Direct URL mode
             info!(
                 "VllmPDRouter::new called in direct URL mode with {} prefill, {} decode workers",
                 prefill_urls.len(),
                 decode_urls.len()
             );
 
-            // Create underlying PD router with provided worker lists
-            let pd_router = PDRouter::new(prefill_urls, decode_urls, ctx).await?;
+            // Automatically expand to DP-aware format when intra_node_data_parallel_size > 1
+            let (expanded_prefill_urls, expanded_decode_urls) =
+                if ctx.router_config.intra_node_data_parallel_size > 1 {
+                    info!(
+                        "DP-aware mode enabled (intra_node_data_parallel_size={}), expanding worker URLs",
+                        ctx.router_config.intra_node_data_parallel_size
+                    );
+
+                    let prefill_base_urls: Vec<String> =
+                        prefill_urls.iter().map(|(url, _)| url.clone()).collect();
+
+                    let expanded_prefill = dp_utils::get_dp_aware_workers(
+                        &prefill_base_urls,
+                        &ctx.router_config.api_key,
+                        ctx.router_config.intra_node_data_parallel_size,
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to expand prefill workers: {}", e))?;
+
+                    let expanded_decode = dp_utils::get_dp_aware_workers(
+                        &decode_urls,
+                        &ctx.router_config.api_key,
+                        ctx.router_config.intra_node_data_parallel_size,
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to expand decode workers: {}", e))?;
+
+                    info!(
+                        "Expanded {} prefill URLs to {} DP-aware URLs",
+                        prefill_base_urls.len(),
+                        expanded_prefill.len()
+                    );
+                    info!(
+                        "Expanded {} decode URLs to {} DP-aware URLs",
+                        decode_urls.len(),
+                        expanded_decode.len()
+                    );
+
+                    let prefill_with_ports: Vec<(String, Option<u16>)> = expanded_prefill
+                        .into_iter()
+                        .map(|url| {
+                            let port = prefill_urls.first().and_then(|(_, p)| *p);
+                            (url, port)
+                        })
+                        .collect();
+
+                    (prefill_with_ports, expanded_decode)
+                } else {
+                    info!("DP-aware mode disabled, using original worker URLs");
+                    (prefill_urls, decode_urls)
+                };
+
+            // Register prefill workers in the registry
+            for (url, port) in &expanded_prefill_urls {
+                let worker = BasicWorker::new(
+                    url.clone(),
+                    WorkerType::Prefill {
+                        bootstrap_port: *port,
+                    },
+                )
+                .with_circuit_breaker_config(core_cb_config.clone())
+                .with_health_config(HealthConfig {
+                    timeout_secs: ctx.router_config.health_check.timeout_secs,
+                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                    endpoint: ctx.router_config.health_check.endpoint.clone(),
+                    failure_threshold: ctx.router_config.health_check.failure_threshold,
+                    success_threshold: ctx.router_config.health_check.success_threshold,
+                });
+                ctx.worker_registry.register(Arc::new(worker));
+            }
+
+            // Register decode workers in the registry
+            for url in &expanded_decode_urls {
+                let worker = BasicWorker::new(url.clone(), WorkerType::Decode)
+                    .with_circuit_breaker_config(core_cb_config.clone())
+                    .with_health_config(HealthConfig {
+                        timeout_secs: ctx.router_config.health_check.timeout_secs,
+                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                        endpoint: ctx.router_config.health_check.endpoint.clone(),
+                        failure_threshold: ctx.router_config.health_check.failure_threshold,
+                        success_threshold: ctx.router_config.health_check.success_threshold,
+                    });
+                ctx.worker_registry.register(Arc::new(worker));
+            }
+
+            // Get all workers from registry for health check
+            let all_workers = ctx.worker_registry.get_all();
+            let all_urls: Vec<String> = all_workers
+                .iter()
+                .map(|worker| worker.url().to_string())
+                .collect();
+            if !all_urls.is_empty() {
+                crate::routers::http::router::Router::wait_for_healthy_workers(
+                    &all_urls,
+                    ctx.router_config.worker_startup_timeout_secs,
+                    ctx.router_config.worker_startup_check_interval_secs,
+                )
+                .await?;
+            }
+
+            // Set up background load monitoring for power-of-two selection
+            let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
+            let worker_loads = Arc::new(rx);
+
+            let prefill_policy = ctx.policy_registry.get_prefill_policy();
+            let decode_policy = ctx.policy_registry.get_decode_policy();
+
+            let load_monitor_handle =
+                if prefill_policy.name() == "power_of_two" || decode_policy.name() == "power_of_two" {
+                    let monitor_urls = all_urls.clone();
+                    let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
+                    let monitor_client = ctx.client.clone();
+                    let prefill_policy_clone = Arc::clone(&prefill_policy);
+                    let decode_policy_clone = Arc::clone(&decode_policy);
+
+                    Some(Arc::new(tokio::spawn(async move {
+                        Self::monitor_worker_loads_with_client(
+                            monitor_urls,
+                            tx,
+                            monitor_interval,
+                            monitor_client,
+                            prefill_policy_clone,
+                            decode_policy_clone,
+                        )
+                        .await;
+                    })))
+                } else {
+                    None
+                };
 
             // No service discovery in direct URL mode
             let service_registry = ServiceRegistry::new();
@@ -956,10 +1582,19 @@ impl VllmPDRouter {
             info!("VllmPDRouter created successfully with direct URLs");
 
             Ok(Self {
-                pd_router,
+                worker_registry: Arc::clone(&ctx.worker_registry),
+                policy_registry: Arc::clone(&ctx.policy_registry),
+                worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,
+                worker_startup_check_interval_secs: ctx.router_config.worker_startup_check_interval_secs,
+                worker_loads,
+                load_monitor_handle,
+                client: ctx.client.clone(),
+                prefill_client,
+                retry_config: ctx.router_config.effective_retry_config(),
+                circuit_breaker_config: core_cb_config,
+                prefill_drain_tx,
                 service_registry: Arc::new(service_registry),
                 http_client: reqwest::Client::new(),
-                policy_registry: ctx.policy_registry.clone(),
                 use_discovery: false,
                 enable_profiling: ctx.router_config.enable_profiling,
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
@@ -970,42 +1605,181 @@ impl VllmPDRouter {
     }
 
     /// Add a prefill server to the router
-    /// Delegates to the underlying PDRouter
     pub async fn add_prefill_server(
         &self,
         url: String,
         bootstrap_port: Option<u16>,
     ) -> Result<String, PDRouterError> {
-        self.pd_router.add_prefill_server(url, bootstrap_port).await
+        // Wait for the new server to be healthy
+        self.wait_for_server_health(&url).await?;
+
+        // Check if already exists
+        if self.worker_registry.get_by_url(&url).is_some() {
+            return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+        }
+
+        // Create Worker for the new prefill server with circuit breaker configuration
+        let worker = WorkerFactory::create_prefill_with_config(
+            url.clone(),
+            bootstrap_port,
+            self.circuit_breaker_config.clone(),
+        );
+
+        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+
+        // Register the worker in the registry
+        self.worker_registry.register(worker_arc.clone());
+
+        // Notify PolicyRegistry about the new worker
+        let model_id = worker_arc.model_id();
+        let policy = self.policy_registry.on_worker_added(model_id, None);
+
+        // If this is a cache-aware policy, update it with all workers for this model
+        if policy.name() == "cache_aware" {
+            if let Some(cache_aware) = policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+            {
+                let model_workers = self.worker_registry.get_by_model_fast(model_id);
+                cache_aware.init_workers(&model_workers);
+            }
+        }
+
+        info!("Added prefill server: {}", url);
+        Ok(format!("Successfully added prefill server: {}", url))
     }
 
     /// Add a decode server to the router
-    /// Delegates to the underlying PDRouter
     pub async fn add_decode_server(&self, url: String) -> Result<String, PDRouterError> {
-        self.pd_router.add_decode_server(url).await
+        // Wait for the new server to be healthy
+        self.wait_for_server_health(&url).await?;
+
+        // Check if already exists
+        if self.worker_registry.get_by_url(&url).is_some() {
+            return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+        }
+
+        // Create Worker for the new decode server with circuit breaker configuration
+        let worker = WorkerFactory::create_decode_with_config(
+            url.clone(),
+            self.circuit_breaker_config.clone(),
+        );
+
+        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+
+        // Register the worker in the registry
+        self.worker_registry.register(worker_arc.clone());
+
+        // Notify PolicyRegistry about the new worker
+        let model_id = worker_arc.model_id();
+        let policy = self.policy_registry.on_worker_added(model_id, None);
+
+        // If this is a cache-aware policy, update it with all workers for this model
+        if policy.name() == "cache_aware" {
+            if let Some(cache_aware) = policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+            {
+                let model_workers = self.worker_registry.get_by_model_fast(model_id);
+                cache_aware.init_workers(&model_workers);
+            }
+        }
+
+        info!("Added decode server: {}", url);
+        Ok(format!("Successfully added decode server: {}", url))
     }
 
     /// Remove a prefill server from the router
-    /// Delegates to the underlying PDRouter
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
-        self.pd_router.remove_prefill_server(url).await
+        // Check if worker exists and get model_id
+        let model_id = match self.worker_registry.get_by_url(url) {
+            Some(worker) => worker.model_id().to_string(),
+            None => {
+                return Err(PDRouterError::WorkerNotFound {
+                    url: url.to_string(),
+                });
+            }
+        };
+
+        // Remove from registry
+        let removed = self.worker_registry.remove_by_url(url);
+
+        if removed.is_some() {
+            // Notify PolicyRegistry about the removed worker
+            self.policy_registry.on_worker_removed(&model_id);
+
+            // Get the policy for this model to update cache-aware if needed
+            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
+                if policy.name() == "cache_aware" {
+                    if let Some(cache_aware) = policy
+                        .as_any()
+                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                    {
+                        cache_aware.remove_worker_by_url(url);
+                    }
+                }
+            }
+        }
+
+        if removed.is_some() {
+            info!("Removed prefill server: {}", url);
+            Ok(format!("Successfully removed prefill server: {}", url))
+        } else {
+            Err(PDRouterError::WorkerNotFound {
+                url: url.to_string(),
+            })
+        }
     }
 
     /// Remove a decode server from the router
-    /// Delegates to the underlying PDRouter
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
-        self.pd_router.remove_decode_server(url).await
+        // Check if worker exists and get model_id
+        let model_id = match self.worker_registry.get_by_url(url) {
+            Some(worker) => worker.model_id().to_string(),
+            None => {
+                return Err(PDRouterError::WorkerNotFound {
+                    url: url.to_string(),
+                });
+            }
+        };
+
+        // Remove from registry
+        let removed = self.worker_registry.remove_by_url(url);
+
+        if removed.is_some() {
+            // Notify PolicyRegistry about the removed worker
+            self.policy_registry.on_worker_removed(&model_id);
+
+            // Get the policy for this model to update cache-aware if needed
+            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
+                if policy.name() == "cache_aware" {
+                    if let Some(cache_aware) = policy
+                        .as_any()
+                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                    {
+                        cache_aware.remove_worker_by_url(url);
+                    }
+                }
+            }
+        }
+
+        if removed.is_some() {
+            info!("Removed decode server: {}", url);
+            Ok(format!("Successfully removed decode server: {}", url))
+        } else {
+            Err(PDRouterError::WorkerNotFound {
+                url: url.to_string(),
+            })
+        }
     }
 
-    /// Get a reference to the underlying PDRouter's worker registry
-    /// This allows access to worker information for refresh operations
-    pub fn worker_registry(&self) -> &crate::core::WorkerRegistry {
-        &self.pd_router.worker_registry
+    /// Get a reference to the worker registry
+    pub fn worker_registry(&self) -> &WorkerRegistry {
+        &self.worker_registry
     }
 }
 
-// Delegate most RouterTrait methods to the underlying PDRouter,
-// but override specific ones for vLLM behavior
+// Self-contained RouterTrait implementation
 #[async_trait]
 impl RouterTrait for VllmPDRouter {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1013,35 +1787,50 @@ impl RouterTrait for VllmPDRouter {
     }
 
     async fn health(&self, req: Request<Body>) -> Response {
-        self.pd_router.health(req).await
+        let headers = header_utils::copy_request_headers(&req);
+        self.proxy_to_first_prefill_worker("health", Some(headers))
+            .await
     }
 
     async fn health_generate(&self, req: Request<Body>) -> Response {
-        self.pd_router.health_generate(req).await
+        let headers = header_utils::copy_request_headers(&req);
+        self.proxy_to_first_prefill_worker("health_generate", Some(headers))
+            .await
     }
 
     async fn get_server_info(&self, req: Request<Body>) -> Response {
-        self.pd_router.get_server_info(req).await
+        let headers = header_utils::copy_request_headers(&req);
+        self.proxy_to_first_prefill_worker("get_server_info", Some(headers))
+            .await
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
-        self.pd_router.get_models(req).await
+        let headers = header_utils::copy_request_headers(&req);
+        self.proxy_to_first_prefill_worker("v1/models", Some(headers))
+            .await
     }
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
-        self.pd_router.get_model_info(req).await
+        let headers = header_utils::copy_request_headers(&req);
+        self.proxy_to_first_prefill_worker("get_model_info", Some(headers))
+            .await
     }
 
     async fn route_generate(
         &self,
-        headers: Option<&HeaderMap>,
-        body: &crate::protocols::spec::GenerateRequest,
-        model_id: Option<&str>,
+        _headers: Option<&HeaderMap>,
+        _body: &crate::protocols::spec::GenerateRequest,
+        _model_id: Option<&str>,
     ) -> Response {
-        self.pd_router.route_generate(headers, body, model_id).await
+        // For now, route_generate is not supported in vLLM PD mode
+        // This would need additional implementation for the /generate endpoint
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Generate endpoint not implemented for vLLM PD mode",
+        )
+            .into_response()
     }
 
-    // Override OpenAI-compatible routes for vLLM two-stage processing
     async fn route_chat(
         &self,
         _headers: Option<&HeaderMap>,
@@ -1053,138 +1842,34 @@ impl RouterTrait for VllmPDRouter {
             self.use_discovery
         );
 
+        // Convert to generic request
+        let request_json = match serde_json::to_value(body) {
+            Ok(json) => {
+                info!(
+                    "Serialized chat request: {}",
+                    serde_json::to_string_pretty(&json).unwrap_or_default()
+                );
+                json
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Serialization error: {}", e),
+                )
+                    .into_response()
+            }
+        };
+
         if self.use_discovery {
-            // Discovery mode - use vLLM-specific two-stage processing
+            // Discovery mode - use vLLM-specific two-stage processing with service discovery
             info!("Using service discovery mode, processing vLLM two-stage request");
-
-            // Convert to generic request and use vLLM processing
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    info!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
-
-            // Process vLLM two-stage request with service discovery
             self.process_vllm_request(request_json, "/v1/chat/completions")
                 .await
         } else {
-            // Direct URL mode - implement routing logic here (not delegating to PDRouter)
+            // Direct URL mode - use worker registry
             info!("Using direct URL mode with VllmPDRouter's own routing logic");
-
-            // Convert request to JSON
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    info!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
-
-            // Get prefill and decode workers from worker_registry
-            let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
-            let decode_workers = self.pd_router.worker_registry.get_decode_workers();
-
-            info!(
-                "Found {} prefill workers, {} decode workers from worker_registry",
-                prefill_workers.len(),
-                decode_workers.len()
-            );
-
-            if prefill_workers.is_empty() || decode_workers.is_empty() {
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "No workers available: {} prefill, {} decode",
-                        prefill_workers.len(),
-                        decode_workers.len()
-                    ),
-                )
-                    .into_response();
-            }
-
-            // Select workers using policy
-            let request_text = serde_json::to_string(&request_json).ok();
-            let request_str = request_text.as_deref();
-
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
-            let prefill_idx = match prefill_policy.select_worker(&prefill_workers, request_str) {
-                Some(idx) => idx,
-                None => {
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let decode_idx = match decode_policy.select_worker(&decode_workers, request_str) {
-                Some(idx) => idx,
-                None => {
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let prefill_worker = &prefill_workers[prefill_idx];
-            let decode_worker = &decode_workers[decode_idx];
-
-            info!(
-                "Selected prefill={} [policy:{}], decode={} [policy:{}]",
-                prefill_worker.url(),
-                prefill_policy.name(),
-                decode_worker.url(),
-                decode_policy.name()
-            );
-
-            // Execute dual dispatch with vLLM two-stage processing
-            match self
-                .process_vllm_two_stage_request(
-                    request_json,
-                    prefill_worker.clone(),
-                    decode_worker.clone(),
-                    "/v1/chat/completions",
-                )
+            self.process_direct_url_request(request_json, "/v1/chat/completions")
                 .await
-            {
-                Ok(response) => {
-                    info!("Two-stage processing completed successfully");
-                    response
-                }
-                Err(e) => {
-                    info!("Two-stage processing failed: {}", e);
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Request processing failed: {}", e),
-                    )
-                        .into_response()
-                }
-            }
         }
     }
 
@@ -1199,186 +1884,130 @@ impl RouterTrait for VllmPDRouter {
             self.use_discovery
         );
 
+        // Convert to generic request
+        let request_json = match serde_json::to_value(body) {
+            Ok(json) => {
+                info!(
+                    "Serialized completion request: {}",
+                    serde_json::to_string_pretty(&json).unwrap_or_default()
+                );
+                json
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Serialization error: {}", e),
+                )
+                    .into_response()
+            }
+        };
+
         if self.use_discovery {
-            // Discovery mode - use vLLM-specific two-stage processing
+            // Discovery mode - use vLLM-specific two-stage processing with service discovery
             info!("Using service discovery mode, processing vLLM two-stage request");
-
-            // Convert to generic request and use vLLM processing
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    info!(
-                        "Serialized completion request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
-
-            // Process vLLM two-stage request with service discovery
             self.process_vllm_request(request_json, "/v1/completions")
                 .await
         } else {
-            // Direct URL mode - implement routing logic here (not delegating to PDRouter)
+            // Direct URL mode - use worker registry
             info!("Using direct URL mode with VllmPDRouter's own routing logic");
-
-            // Convert request to JSON
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    info!(
-                        "Serialized completion request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
-
-            // Get prefill and decode workers from worker_registry
-            let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
-            let decode_workers = self.pd_router.worker_registry.get_decode_workers();
-
-            info!(
-                "Found {} prefill workers, {} decode workers from worker_registry",
-                prefill_workers.len(),
-                decode_workers.len()
-            );
-
-            if prefill_workers.is_empty() || decode_workers.is_empty() {
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "No workers available: {} prefill, {} decode",
-                        prefill_workers.len(),
-                        decode_workers.len()
-                    ),
-                )
-                    .into_response();
-            }
-
-            // Select workers using policy
-            let request_text = serde_json::to_string(&request_json).ok();
-            let request_str = request_text.as_deref();
-
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
-            let prefill_idx = match prefill_policy.select_worker(&prefill_workers, request_str) {
-                Some(idx) => idx,
-                None => {
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let decode_idx = match decode_policy.select_worker(&decode_workers, request_str) {
-                Some(idx) => idx,
-                None => {
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let prefill_worker = &prefill_workers[prefill_idx];
-            let decode_worker = &decode_workers[decode_idx];
-
-            info!(
-                "Selected prefill={} [policy:{}], decode={} [policy:{}]",
-                prefill_worker.url(),
-                prefill_policy.name(),
-                decode_worker.url(),
-                decode_policy.name()
-            );
-
-            // Execute dual dispatch with vLLM two-stage processing
-            match self
-                .process_vllm_two_stage_request(
-                    request_json,
-                    prefill_worker.clone(),
-                    decode_worker.clone(),
-                    "/v1/completions",
-                )
+            self.process_direct_url_request(request_json, "/v1/completions")
                 .await
-            {
-                Ok(response) => {
-                    info!("Two-stage processing completed successfully");
-                    response
-                }
-                Err(e) => {
-                    info!("Two-stage processing failed: {}", e);
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Request processing failed: {}", e),
-                    )
-                        .into_response()
-                }
-            }
         }
     }
 
     async fn route_responses(
         &self,
-        headers: Option<&HeaderMap>,
-        body: &crate::protocols::spec::ResponsesRequest,
-        model_id: Option<&str>,
+        _headers: Option<&HeaderMap>,
+        _body: &crate::protocols::spec::ResponsesRequest,
+        _model_id: Option<&str>,
     ) -> Response {
-        self.pd_router
-            .route_responses(headers, body, model_id)
-            .await
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses endpoint not implemented for vLLM PD mode",
+        )
+            .into_response()
     }
 
-    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        self.pd_router.get_response(headers, response_id).await
+    async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Get response endpoint not implemented for vLLM PD mode",
+        )
+            .into_response()
     }
 
-    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        self.pd_router.cancel_response(headers, response_id).await
+    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Cancel response endpoint not implemented for vLLM PD mode",
+        )
+            .into_response()
     }
 
     async fn route_embeddings(
         &self,
-        headers: Option<&HeaderMap>,
-        body: &crate::protocols::spec::EmbeddingRequest,
-        model_id: Option<&str>,
+        _headers: Option<&HeaderMap>,
+        _body: &crate::protocols::spec::EmbeddingRequest,
+        _model_id: Option<&str>,
     ) -> Response {
-        self.pd_router
-            .route_embeddings(headers, body, model_id)
-            .await
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Embeddings endpoint not implemented for vLLM PD mode",
+        )
+            .into_response()
     }
 
     async fn route_rerank(
         &self,
-        headers: Option<&HeaderMap>,
-        body: &crate::protocols::spec::RerankRequest,
-        model_id: Option<&str>,
+        _headers: Option<&HeaderMap>,
+        _body: &crate::protocols::spec::RerankRequest,
+        _model_id: Option<&str>,
     ) -> Response {
-        self.pd_router.route_rerank(headers, body, model_id).await
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Rerank endpoint not implemented for vLLM PD mode",
+        )
+            .into_response()
     }
 
     async fn flush_cache(&self) -> Response {
-        self.pd_router.flush_cache().await
+        // Flush cache on all workers
+        let prefill_workers = self.worker_registry.get_prefill_workers();
+        let decode_workers = self.worker_registry.get_decode_workers();
+
+        let mut results = Vec::new();
+        let mut errors = Vec::new();
+
+        for worker in prefill_workers.iter().chain(decode_workers.iter()) {
+            let (base_url, _) = dp_utils::parse_worker_url(worker.url());
+            let url = format!("{}/flush_cache", base_url);
+            match self.client.post(&url).send().await {
+                Ok(res) if res.status().is_success() => {
+                    results.push(format!("{}: OK", worker.url()));
+                }
+                Ok(res) => {
+                    errors.push(format!("{} returned status: {}", worker.url(), res.status()));
+                }
+                Err(e) => {
+                    errors.push(format!("{} error: {}", worker.url(), e));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            (StatusCode::OK, format!("Flushed cache: {:?}", results)).into_response()
+        } else {
+            (
+                StatusCode::PARTIAL_CONTENT,
+                format!("Results: {:?}, Errors: {:?}", results, errors),
+            )
+                .into_response()
+        }
     }
 
     async fn get_worker_loads(&self) -> Response {
-        self.pd_router.get_worker_loads().await
+        let loads = self.worker_loads.borrow().clone();
+        (StatusCode::OK, serde_json::to_string(&loads).unwrap_or_default()).into_response()
     }
 
     fn router_type(&self) -> &'static str {
@@ -1386,22 +2015,64 @@ impl RouterTrait for VllmPDRouter {
     }
 
     fn readiness(&self) -> Response {
-        self.pd_router.readiness()
+        // Check if we have any workers available
+        let prefill_count = self.worker_registry.get_prefill_workers().len();
+        let decode_count = self.worker_registry.get_decode_workers().len();
+
+        if self.use_discovery {
+            // In discovery mode, check service registry
+            let prefill_instances = self.service_registry.get_prefill_instances();
+            let decode_instances = self.service_registry.get_decode_instances();
+
+            if !prefill_instances.is_empty() && !decode_instances.is_empty() {
+                (StatusCode::OK, "Ready (discovery mode)").into_response()
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "Not ready: {} prefill, {} decode instances discovered",
+                        prefill_instances.len(),
+                        decode_instances.len()
+                    ),
+                )
+                    .into_response()
+            }
+        } else {
+            // In direct URL mode, check worker registry
+            if prefill_count > 0 && decode_count > 0 {
+                (StatusCode::OK, "Ready").into_response()
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "Not ready: {} prefill, {} decode workers",
+                        prefill_count, decode_count
+                    ),
+                )
+                    .into_response()
+            }
+        }
     }
 }
 
-// Delegate WorkerManagement to the underlying PDRouter
+// Self-contained WorkerManagement implementation
 #[async_trait]
 impl WorkerManagement for VllmPDRouter {
-    async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
-        self.pd_router.add_worker(worker_url).await
+    async fn add_worker(&self, _worker_url: &str) -> Result<String, String> {
+        // VllmPDRouter requires separate add_prefill_server/add_decode_server calls
+        Err("VllmPDRouter requires add_prefill_server or add_decode_server".to_string())
     }
 
     fn remove_worker(&self, worker_url: &str) {
-        self.pd_router.remove_worker(worker_url);
+        // Remove from registry directly
+        self.worker_registry.remove_by_url(worker_url);
     }
 
     fn get_worker_urls(&self) -> Vec<String> {
-        self.pd_router.get_worker_urls()
+        self.worker_registry
+            .get_all()
+            .iter()
+            .map(|w| w.url().to_string())
+            .collect()
     }
 }

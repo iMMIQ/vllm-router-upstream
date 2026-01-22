@@ -564,7 +564,7 @@ impl Router {
                     .await;
 
                 // Client errors (4xx) are not worker failures - only server errors (5xx)
-                // should count against the circuit breaker. This matches pd_router.rs behavior.
+                // should count against the circuit breaker. This matches vllm_pd_router.rs behavior.
                 let status = response.status();
                 worker.record_outcome(status.is_success() || status.is_client_error());
 

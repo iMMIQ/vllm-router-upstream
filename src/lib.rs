@@ -57,7 +57,6 @@ struct Router {
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
-    pd_disaggregation: bool,
     vllm_pd_disaggregation: bool,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
@@ -147,13 +146,6 @@ impl Router {
                 prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
                 decode_policy: self.decode_policy.as_ref().map(convert_policy),
                 discovery_address: None,
-            }
-        } else if self.pd_disaggregation {
-            RoutingMode::PrefillDecode {
-                prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
-                decode_urls: self.decode_urls.clone().unwrap_or_default(),
-                prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
-                decode_policy: self.decode_policy.as_ref().map(convert_policy),
             }
         } else {
             RoutingMode::Regular {
@@ -274,8 +266,7 @@ impl Router {
         prometheus_host = None,
         request_timeout_secs = 1800,  // Add configurable request timeout
         request_id_headers = None,  // Custom request ID headers
-        pd_disaggregation = false,  // New flag for PD mode
-        vllm_pd_disaggregation = false,  // New flag for PD mode
+        vllm_pd_disaggregation = false,  // Flag for vLLM PD mode
         prefill_urls = None,
         decode_urls = None,
         prefill_policy = None,
@@ -339,7 +330,6 @@ impl Router {
         prometheus_host: Option<String>,
         request_timeout_secs: u64,
         request_id_headers: Option<Vec<String>>,
-        pd_disaggregation: bool,
         vllm_pd_disaggregation: bool,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
@@ -415,7 +405,6 @@ impl Router {
             prometheus_host,
             request_timeout_secs,
             request_id_headers,
-            pd_disaggregation,
             vllm_pd_disaggregation,
             prefill_urls,
             decode_urls,
@@ -471,7 +460,7 @@ impl Router {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
-                pd_mode: self.pd_disaggregation,
+                pd_mode: self.vllm_pd_disaggregation,
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
