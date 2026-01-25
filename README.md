@@ -42,7 +42,12 @@ cargo build --release
 ```
 
 #### Python Package
+Install from PyPI
 ```bash
+pip install vllm-router                                                                                                                                                        ```
+
+To build from source:
+```bash    
 pip install setuptools-rust wheel build
 python -m build
 pip install dist/*.whl
