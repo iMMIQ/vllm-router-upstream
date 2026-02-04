@@ -40,10 +40,10 @@ steps:
   - wait
 
   # ============================================================================
-  # Build Release Artifacts
+  # Build Release Artifacts (x86_64 and aarch64 in parallel)
   # ============================================================================
-  - label: ":package: Build Release Artifacts"
-    key: "build_wheels"
+  - label: ":package: Build Release Artifacts (x86_64)"
+    key: "build_wheels_x86_64"
     plugins:
       - docker#v5.11.0:
           image: "quay.io/pypa/manylinux_2_28_x86_64"
@@ -85,13 +85,54 @@ steps:
     agents:
       queue: "cpu_queue_postmerge"
 
+  - label: ":package: Build Release Artifacts (aarch64)"
+    key: "build_wheels_aarch64"
+    plugins:
+      - docker#v5.11.0:
+          image: "quay.io/pypa/manylinux_2_28_aarch64"
+          workdir: /workdir
+          volumes:
+            - ".:/workdir"
+          environment:
+            - "CARGO_INCREMENTAL=0"
+            - "RUST_BACKTRACE=1"
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+
+              # Install system dependencies (manylinux_2_28 uses dnf)
+              dnf install -y openssl-devel protobuf-compiler protobuf-devel
+
+              # Install Rust toolchain
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
+              source $$HOME/.cargo/env
+
+              # Build Rust binary for release
+              cargo build --release
+
+              # Build Python wheels using Python 3.9 (available in manylinux image)
+              /opt/python/cp39-cp39/bin/pip install -U pip setuptools wheel setuptools-rust build auditwheel
+              /opt/python/cp39-cp39/bin/python -m build
+
+              # Repair wheel to have proper manylinux tags
+              /opt/python/cp39-cp39/bin/auditwheel repair dist/*.whl -w dist/
+              # Remove the original non-manylinux wheel
+              rm dist/*-linux_aarch64.whl || true
+    artifact_paths:
+      - "dist/*.whl"
+    depends_on: "version-check"
+    agents:
+      queue: "arm-cpu"
+
   - wait
 
   # ============================================================================
   # Run Release Tests
   # ============================================================================
-  - label: ":test_tube: Smoke Test Release Binary"
-    key: "smoke-test-binary"
+  - label: ":test_tube: Smoke Test Release Binary (x86_64)"
+    key: "smoke-test-binary-x86_64"
     command: |
       buildkite-agent artifact download "target/release/vllm-router" .
       chmod +x target/release/vllm-router
@@ -100,14 +141,23 @@ steps:
     agents:
       queue: "cpu_queue_postmerge"
 
-  - label: ":python: Test Python Wheel"
-    key: "test-python-wheel"
+  - label: ":python: Test Python Wheel (x86_64)"
+    key: "test-python-wheel-x86_64"
     command: |
-      buildkite-agent artifact download "dist/*.whl" .
-      pip install dist/*.whl
+      buildkite-agent artifact download "dist/*x86_64*.whl" .
+      pip install dist/*x86_64*.whl
       python -c "import vllm_router; print(vllm_router.__version__)"
     agents:
       queue: "cpu_queue_postmerge"
+
+  - label: ":python: Test Python Wheel (aarch64)"
+    key: "test-python-wheel-aarch64"
+    command: |
+      buildkite-agent artifact download "dist/*aarch64*.whl" .
+      pip install dist/*aarch64*.whl
+      python -c "import vllm_router; print(vllm_router.__version__)"
+    agents:
+      queue: "arm-cpu"
 
   - wait
 
@@ -119,7 +169,7 @@ steps:
     command: |
       set -euo pipefail
 
-      # Download build artifacts
+      # Download build artifacts from both architectures
       buildkite-agent artifact download "dist/*.whl" .
       buildkite-agent artifact download "dist/*.tar.gz" .
 
@@ -136,9 +186,11 @@ steps:
           echo "✅ Successfully published to PyPI!"
         '
     depends_on:
-      - "build_wheels"
-      - "test-python-wheel"
-      - "smoke-test-binary"
+      - "build_wheels_x86_64"
+      - "build_wheels_aarch64"
+      - "test-python-wheel-x86_64"
+      - "test-python-wheel-aarch64"
+      - "smoke-test-binary-x86_64"
     if: build.tag =~ /^v.*/
     soft_fail: false
     agents:
