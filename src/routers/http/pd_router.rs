@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -2253,6 +2253,103 @@ impl RouterTrait for PDRouter {
                 })),
             )
                 .into_response()
+        }
+    }
+
+    /// Route a transparent proxy request through the P/D disaggregation pipeline
+    /// For unmatched paths, we forward directly to a decode worker
+    async fn route_transparent(
+        &self,
+        headers: Option<&HeaderMap>,
+        path: &str,
+        method: &Method,
+        body: serde_json::Value,
+    ) -> Response {
+        // Only handle POST requests for inference
+        if *method != Method::POST {
+            return (
+                StatusCode::METHOD_NOT_ALLOWED,
+                "Only POST requests are supported for transparent proxy",
+            )
+                .into_response();
+        }
+
+        debug!(
+            "PDRouter transparent proxy: routing {} {} to decode worker",
+            method, path
+        );
+
+        // Get decode workers (for transparent proxy, we just forward to decode)
+        let decode_workers = self.worker_registry.get_decode_workers();
+
+        if decode_workers.is_empty() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No decode workers available",
+            )
+                .into_response();
+        }
+
+        // Select a decode worker using policy
+        let decode_policy = self.policy_registry.get_decode_policy();
+        let decode_idx = match decode_policy.select_worker(&decode_workers, None) {
+            Some(idx) => idx,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Decode policy failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
+
+        let decode_worker = &decode_workers[decode_idx];
+        let url = format!("{}{}", decode_worker.url(), path);
+
+        debug!("PDRouter transparent proxy: forwarding to {}", url);
+
+        // Build the request
+        let mut request_builder = self.client.post(&url);
+
+        // Propagate headers
+        request_builder = header_utils::propagate_trace_headers(request_builder, headers);
+
+        // Add JSON body if not null
+        if !body.is_null() {
+            request_builder = request_builder.json(&body);
+        }
+
+        // Send request
+        match request_builder.send().await {
+            Ok(response) => {
+                let status = StatusCode::from_u16(response.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let resp_headers = response.headers().clone();
+
+                // Stream the response body
+                let body = Body::from_stream(response.bytes_stream());
+                let mut response_builder = Response::builder().status(status);
+
+                for (name, value) in resp_headers.iter() {
+                    if name != "transfer-encoding" && name != "content-length" {
+                        response_builder = response_builder.header(name, value);
+                    }
+                }
+
+                match response_builder.body(body) {
+                    Ok(response) => response,
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to build response: {}", e),
+                    )
+                        .into_response(),
+                }
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                format!("Backend request failed: {}", e),
+            )
+                .into_response(),
         }
     }
 }

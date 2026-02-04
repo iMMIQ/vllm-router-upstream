@@ -125,6 +125,52 @@ async fn sink_handler() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
+/// Transparent proxy handler for unmatched routes
+/// Routes requests through the router's route_transparent method
+async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let headers = req.headers().clone();
+
+    // Check authorization
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    // Extract path and method
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+
+    // Read body
+    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read request body: {}", e),
+            )
+                .into_response()
+        }
+    };
+
+    // Parse body as JSON
+    let body_json: serde_json::Value = if body_bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        match serde_json::from_slice(&body_bytes) {
+            Ok(json) => json,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("Invalid JSON body: {}", e))
+                    .into_response()
+            }
+        }
+    };
+
+    // Route through transparent proxy
+    state
+        .router
+        .route_transparent(Some(&headers), &path, &method, body_json)
+        .await
+}
+
 // Health check endpoints
 async fn liveness(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let headers = req.headers().clone();
@@ -658,6 +704,7 @@ pub fn build_app(
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
+    enable_transparent_proxy: bool,
 ) -> Router {
     // Create routes
     let protected_routes = Router::new()
@@ -706,8 +753,8 @@ pub fn build_app(
         .route("/workers/{url}", get(get_worker))
         .route("/workers/{url}", delete(delete_worker));
 
-    // Build app with all routes and middleware
-    Router::new()
+    // Build base app with all routes and middleware
+    let base_app = Router::new()
         .merge(protected_routes)
         .merge(public_routes)
         .merge(admin_routes)
@@ -718,9 +765,16 @@ pub fn build_app(
         ))
         .layer(middleware::create_logging_layer())
         .layer(middleware::RequestIdLayer::new(request_id_headers))
-        .layer(create_cors_layer(cors_allowed_origins))
-        .fallback(sink_handler)
-        .with_state(app_state)
+        .layer(create_cors_layer(cors_allowed_origins));
+
+    // Choose fallback based on transparent proxy mode
+    if enable_transparent_proxy {
+        base_app
+            .fallback(transparent_proxy_handler)
+            .with_state(app_state)
+    } else {
+        base_app.fallback(sink_handler).with_state(app_state)
+    }
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -937,11 +991,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     });
 
     // Build the application
+    // Enable transparent proxy for all routing modes
+    let enable_transparent_proxy = true;
+
     let app = build_app(
         app_state,
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
+        enable_transparent_proxy,
     );
 
     let addr = format!("{}:{}", config.host, config.port);

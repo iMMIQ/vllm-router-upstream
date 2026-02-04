@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
@@ -787,6 +787,29 @@ impl RouterTrait for RouterManager {
         } else {
             // TODO: Check readiness of all routers
             (StatusCode::OK, "Ready").into_response()
+        }
+    }
+
+    /// Route a transparent proxy request through the appropriate router
+    async fn route_transparent(
+        &self,
+        headers: Option<&HeaderMap>,
+        path: &str,
+        method: &Method,
+        body: serde_json::Value,
+    ) -> Response {
+        // Select router based on headers (no model info available for transparent proxy)
+        let router = self.select_router_for_request(headers, None);
+
+        if let Some(router) = router {
+            router.route_transparent(headers, path, method, body).await
+        } else {
+            // Return 404 when no router is available
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for this request",
+            )
+                .into_response()
         }
     }
 }

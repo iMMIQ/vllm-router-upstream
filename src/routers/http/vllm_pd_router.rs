@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::HeaderMap,
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde_json::{json, Value};
@@ -1463,6 +1463,111 @@ impl RouterTrait for VllmPDRouter {
 
     fn readiness(&self) -> Response {
         self.pd_router.readiness()
+    }
+
+    /// Route a transparent proxy request through the P/D disaggregation pipeline
+    /// This handles any path/body and routes through prefill->decode stages
+    async fn route_transparent(
+        &self,
+        headers: Option<&HeaderMap>,
+        path: &str,
+        method: &Method,
+        body: serde_json::Value,
+    ) -> Response {
+        // Only handle POST requests for inference
+        if *method != Method::POST {
+            return (
+                StatusCode::METHOD_NOT_ALLOWED,
+                "Only POST requests are supported for transparent proxy",
+            )
+                .into_response();
+        }
+
+        debug!(
+            "Transparent proxy: routing {} {} through P/D pipeline",
+            method, path
+        );
+
+        // Body is already a serde_json::Value, use it directly
+        let request_json = body;
+
+        if self.use_discovery {
+            // Discovery mode - use vLLM-specific two-stage processing
+            self.process_vllm_request(request_json, path, headers).await
+        } else {
+            // Direct URL mode - use worker registry
+            let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
+            let decode_workers = self.pd_router.worker_registry.get_decode_workers();
+
+            if prefill_workers.is_empty() || decode_workers.is_empty() {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "No workers available: {} prefill, {} decode",
+                        prefill_workers.len(),
+                        decode_workers.len()
+                    ),
+                )
+                    .into_response();
+            }
+
+            // Select workers using policy
+            let request_text = serde_json::to_string(&request_json).ok();
+            let request_str = request_text.as_deref();
+
+            let prefill_policy = self.policy_registry.get_prefill_policy();
+            let decode_policy = self.policy_registry.get_decode_policy();
+
+            let prefill_idx = match prefill_policy.select_worker(&prefill_workers, request_str) {
+                Some(idx) => idx,
+                None => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Prefill policy failed to select a worker".to_string(),
+                    )
+                        .into_response();
+                }
+            };
+
+            let decode_idx = match decode_policy.select_worker(&decode_workers, request_str) {
+                Some(idx) => idx,
+                None => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Decode policy failed to select a worker".to_string(),
+                    )
+                        .into_response();
+                }
+            };
+
+            let prefill_worker = &prefill_workers[prefill_idx];
+            let decode_worker = &decode_workers[decode_idx];
+
+            debug!(
+                "Transparent proxy: prefill={}, decode={}",
+                prefill_worker.url(),
+                decode_worker.url()
+            );
+
+            // Execute two-stage processing
+            match self
+                .process_vllm_two_stage_request(
+                    request_json,
+                    prefill_worker.clone(),
+                    decode_worker.clone(),
+                    path,
+                    headers,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Transparent proxy request failed: {}", e),
+                )
+                    .into_response(),
+            }
+        }
     }
 }
 

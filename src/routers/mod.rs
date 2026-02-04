@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
 use std::fmt::Debug;
@@ -161,4 +161,18 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
 
     /// Server readiness check - is the server ready to handle requests
     fn readiness(&self) -> Response;
+
+    /// Route a transparent proxy request (any path/body)
+    /// Used for catch-all routing of unmatched paths
+    /// Returns the response from the backend or an error response
+    async fn route_transparent(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _path: &str,
+        _method: &Method,
+        _body: serde_json::Value,
+    ) -> Response {
+        // Default: not supported - return 404
+        (StatusCode::NOT_FOUND, "Not Found").into_response()
+    }
 }

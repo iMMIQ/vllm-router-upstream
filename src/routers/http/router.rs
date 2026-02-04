@@ -1567,6 +1567,107 @@ impl RouterTrait for Router {
                 .into_response()
         }
     }
+
+    /// Route a transparent proxy request to a backend worker
+    /// Forwards the request as-is to a selected worker
+    async fn route_transparent(
+        &self,
+        headers: Option<&HeaderMap>,
+        path: &str,
+        method: &Method,
+        body: serde_json::Value,
+    ) -> Response {
+        debug!("Transparent proxy: routing {} {} to backend", method, path);
+
+        // Select a worker
+        let workers = self.worker_registry.get_all();
+        if workers.is_empty() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No workers available".to_string(),
+            )
+                .into_response();
+        }
+
+        let policy = self.policy_registry.get_default_policy();
+        let worker_idx = match policy.select_worker(&workers, None) {
+            Some(idx) => idx,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Failed to select a worker".to_string(),
+                )
+                    .into_response();
+            }
+        };
+
+        let worker: &dyn Worker = workers[worker_idx].as_ref();
+        let url = format!("{}{}", worker.url(), path);
+
+        debug!("Transparent proxy: forwarding to {}", url);
+
+        // Build the request
+        let mut request_builder = match *method {
+            Method::GET => self.client.get(&url),
+            Method::POST => self.client.post(&url),
+            Method::PUT => self.client.put(&url),
+            Method::DELETE => self.client.delete(&url),
+            Method::PATCH => self.client.patch(&url),
+            Method::HEAD => self.client.head(&url),
+            _ => {
+                return (
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    format!("Method {} not supported", method),
+                )
+                    .into_response();
+            }
+        };
+
+        // Propagate headers
+        request_builder = header_utils::propagate_trace_headers(request_builder, headers);
+
+        // Add JSON body if not null/empty
+        if !body.is_null() {
+            request_builder = request_builder.json(&body);
+        }
+
+        // Add authorization if configured
+        if let Some(ref key) = self.api_key {
+            request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
+        }
+
+        // Send request
+        match request_builder.send().await {
+            Ok(response) => {
+                let status = response.status();
+                let headers = response.headers().clone();
+
+                // Stream the response body
+                let body = Body::from_stream(response.bytes_stream());
+                let mut response_builder = Response::builder().status(status.as_u16());
+
+                for (name, value) in headers.iter() {
+                    if name != "transfer-encoding" && name != "content-length" {
+                        response_builder = response_builder.header(name, value);
+                    }
+                }
+
+                match response_builder.body(body) {
+                    Ok(response) => response,
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to build response: {}", e),
+                    )
+                        .into_response(),
+                }
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                format!("Backend request failed: {}", e),
+            )
+                .into_response(),
+        }
+    }
 }
 
 #[cfg(test)]
