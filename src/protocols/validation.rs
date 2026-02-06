@@ -874,7 +874,7 @@ mod tests {
 
         fn create_valid_chat_request() -> ChatCompletionRequest {
             ChatCompletionRequest {
-                model: "gpt-4".to_string(),
+                model: Some("gpt-4".to_string()),
                 messages: vec![ChatMessage::User {
                     role: "user".to_string(),
                     content: UserMessageContent::Text("Hello".to_string()),

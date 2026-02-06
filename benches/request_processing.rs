@@ -51,7 +51,7 @@ fn default_generate_request() -> GenerateRequest {
 /// Create a default ChatCompletionRequest for benchmarks with minimal fields set
 fn default_chat_completion_request() -> ChatCompletionRequest {
     ChatCompletionRequest {
-        model: String::new(),
+        model: None,
         messages: vec![],
         max_tokens: None,
         max_completion_tokens: None,
@@ -104,7 +104,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
 /// Create a default CompletionRequest for benchmarks with minimal fields set
 fn default_completion_request() -> CompletionRequest {
     CompletionRequest {
-        model: String::new(),
+        model: None,
         prompt: PromptInput::String(String::new()),
         suffix: None,
         max_tokens: None,
@@ -169,7 +169,7 @@ fn create_sample_generate_request() -> GenerateRequest {
 
 fn create_sample_chat_completion_request() -> ChatCompletionRequest {
     ChatCompletionRequest {
-        model: "gpt-3.5-turbo".to_string(),
+        model: Some("gpt-3.5-turbo".to_string()),
         messages: vec![
             ChatMessage::System {
                 role: "system".to_string(),
@@ -198,7 +198,7 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
 
 fn create_sample_completion_request() -> CompletionRequest {
     CompletionRequest {
-        model: "text-davinci-003".to_string(),
+        model: Some("text-davinci-003".to_string()),
         prompt: PromptInput::String("Complete this sentence: The future of AI is".to_string()),
         max_tokens: Some(50),
         temperature: Some(0.8),
@@ -236,7 +236,7 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
     }
 
     ChatCompletionRequest {
-        model: "gpt-4".to_string(),
+        model: Some("gpt-4".to_string()),
         messages,
         max_tokens: Some(1000),
         max_completion_tokens: Some(1000),

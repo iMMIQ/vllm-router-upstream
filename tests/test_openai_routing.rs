@@ -37,7 +37,7 @@ fn create_minimal_chat_request() -> ChatCompletionRequest {
 /// Helper function to create a minimal completion request for testing
 fn create_minimal_completion_request() -> CompletionRequest {
     CompletionRequest {
-        model: "gpt-3.5-turbo".to_string(),
+        model: Some("gpt-3.5-turbo".to_string()),
         prompt: PromptInput::String("Hello".to_string()),
         suffix: None,
         max_tokens: Some(100),

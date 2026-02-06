@@ -346,8 +346,9 @@ pub struct FunctionCallDelta {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
-    /// ID of the model to use
-    pub model: String,
+    /// ID of the model to use (optional, vLLM supports requests without model)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 
     /// A list of messages comprising the conversation so far
     pub messages: Vec<ChatMessage>,
@@ -532,7 +533,7 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn get_model(&self) -> Option<&str> {
-        Some(&self.model)
+        self.model.as_deref()
     }
 
     fn extract_text_for_routing(&self) -> String {
@@ -613,8 +614,9 @@ pub struct ChatStreamChoice {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompletionRequest {
-    /// ID of the model to use (required for OpenAI, optional for some implementations, such as VLLM)
-    pub model: String,
+    /// ID of the model to use (optional, vLLM supports requests without model)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 
     /// The prompt(s) to generate completions for
     /// Supports: str, list[str], list[int], list[list[int]]
@@ -753,7 +755,7 @@ impl GenerationRequest for CompletionRequest {
     }
 
     fn get_model(&self) -> Option<&str> {
-        Some(&self.model)
+        self.model.as_deref()
     }
 
     fn extract_text_for_routing(&self) -> String {
@@ -2174,8 +2176,9 @@ impl RerankResponse {
 /// We intentionally keep fields flexible to pass through to workers.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EmbeddingRequest {
-    /// ID of the model to use
-    pub model: String,
+    /// ID of the model to use (optional, vLLM supports requests without model)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 
     /// Input can be a string, array of strings, tokens, or batch inputs
     pub input: serde_json::Value,
@@ -2204,7 +2207,7 @@ impl GenerationRequest for EmbeddingRequest {
     }
 
     fn get_model(&self) -> Option<&str> {
-        Some(&self.model)
+        self.model.as_deref()
     }
 
     fn extract_text_for_routing(&self) -> String {
@@ -3009,7 +3012,7 @@ mod tests {
     #[test]
     fn test_embedding_request_serialization_string_input() {
         let req = EmbeddingRequest {
-            model: "test-emb".to_string(),
+            model: Some("test-emb".to_string()),
             input: serde_json::Value::String("hello".to_string()),
             encoding_format: Some("float".to_string()),
             user: Some("user-1".to_string()),
@@ -3031,7 +3034,7 @@ mod tests {
     #[test]
     fn test_embedding_request_serialization_array_input() {
         let req = EmbeddingRequest {
-            model: "test-emb".to_string(),
+            model: Some("test-emb".to_string()),
             input: serde_json::json!(["a", "b", "c"]),
             encoding_format: None,
             user: None,
@@ -3048,7 +3051,7 @@ mod tests {
     #[test]
     fn test_embedding_generation_request_trait_string() {
         let req = EmbeddingRequest {
-            model: "emb-model".to_string(),
+            model: Some("emb-model".to_string()),
             input: serde_json::Value::String("hello".to_string()),
             encoding_format: None,
             user: None,
@@ -3063,7 +3066,7 @@ mod tests {
     #[test]
     fn test_embedding_generation_request_trait_array() {
         let req = EmbeddingRequest {
-            model: "emb-model".to_string(),
+            model: Some("emb-model".to_string()),
             input: serde_json::json!(["hello", "world"]),
             encoding_format: None,
             user: None,
@@ -3076,7 +3079,7 @@ mod tests {
     #[test]
     fn test_embedding_generation_request_trait_non_text() {
         let req = EmbeddingRequest {
-            model: "emb-model".to_string(),
+            model: Some("emb-model".to_string()),
             input: serde_json::json!({"tokens": [1, 2, 3]}),
             encoding_format: None,
             user: None,
@@ -3089,7 +3092,7 @@ mod tests {
     #[test]
     fn test_embedding_generation_request_trait_mixed_array_ignores_nested() {
         let req = EmbeddingRequest {
-            model: "emb-model".to_string(),
+            model: Some("emb-model".to_string()),
             input: serde_json::json!(["a", ["b", "c"], 123, {"k": "v"}]),
             encoding_format: None,
             user: None,

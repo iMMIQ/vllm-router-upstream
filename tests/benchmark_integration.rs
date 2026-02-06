@@ -31,7 +31,7 @@ fn default_generate_request() -> GenerateRequest {
 /// Create a default ChatCompletionRequest for benchmarks with minimal fields set
 fn default_chat_completion_request() -> ChatCompletionRequest {
     ChatCompletionRequest {
-        model: String::new(),
+        model: None,
         messages: vec![],
         max_tokens: None,
         max_completion_tokens: None,
@@ -84,7 +84,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
 /// Create a default CompletionRequest for benchmarks with minimal fields set
 fn default_completion_request() -> CompletionRequest {
     CompletionRequest {
-        model: String::new(),
+        model: None,
         prompt: PromptInput::String(String::new()),
         suffix: None,
         max_tokens: None,
@@ -159,7 +159,7 @@ fn test_benchmark_request_creation() {
     };
 
     let chat_req = ChatCompletionRequest {
-        model: "test-model".to_string(),
+        model: Some("test-model".to_string()),
         messages: vec![ChatMessage::User {
             role: "user".to_string(),
             content: UserMessageContent::Text("Test message".to_string()),
@@ -188,7 +188,7 @@ fn test_benchmark_request_creation() {
     };
 
     let completion_req = CompletionRequest {
-        model: "test-model".to_string(),
+        model: Some("test-model".to_string()),
         prompt: PromptInput::String("Test prompt".to_string()),
         max_tokens: Some(50),
         temperature: Some(0.8),

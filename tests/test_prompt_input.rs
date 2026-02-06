@@ -106,7 +106,7 @@ fn test_prompt_input_int_batch() {
 #[test]
 fn test_prompt_input_serialization_roundtrip_string() {
     let req = CompletionRequest {
-        model: "test-model".to_string(),
+        model: Some("test-model".to_string()),
         prompt: PromptInput::String("Hello, world!".to_string()),
         suffix: None,
         max_tokens: Some(100),
@@ -151,7 +151,7 @@ fn test_prompt_input_serialization_roundtrip_string() {
 #[test]
 fn test_prompt_input_serialization_roundtrip_int_array() {
     let req = CompletionRequest {
-        model: "test-model".to_string(),
+        model: Some("test-model".to_string()),
         prompt: PromptInput::IntArray(vec![128000, 9906, 11, 1917, 0]),
         suffix: None,
         max_tokens: Some(100),
