@@ -3104,6 +3104,147 @@ mod tests {
     }
 
     // ==================================================================
+    // =            OPTIONAL MODEL FIELD TESTS                           =
+    // ==================================================================
+
+    #[test]
+    fn test_chat_completion_request_without_model() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(request.model.is_none());
+        assert_eq!(request.get_model(), None);
+    }
+
+    #[test]
+    fn test_chat_completion_request_with_model() {
+        let json = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.model.as_deref(), Some("gpt-4"));
+        assert_eq!(request.get_model(), Some("gpt-4"));
+    }
+
+    #[test]
+    fn test_chat_completion_request_with_null_model() {
+        let json = r#"{
+            "model": null,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(request.model.is_none());
+        assert_eq!(request.get_model(), None);
+    }
+
+    #[test]
+    fn test_chat_completion_request_without_model_roundtrip() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_string(&request).unwrap();
+        // model should not appear in serialized output when None
+        assert!(!serialized.contains("\"model\""));
+
+        let roundtrip: ChatCompletionRequest = serde_json::from_str(&serialized).unwrap();
+        assert!(roundtrip.model.is_none());
+    }
+
+    #[test]
+    fn test_chat_completion_request_without_model_validates() {
+        use crate::protocols::validation::ValidatableRequest;
+
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(request.model.is_none());
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_completion_request_without_model() {
+        let json = r#"{
+            "prompt": "Hello, world!"
+        }"#;
+
+        let request: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(request.model.is_none());
+        assert_eq!(request.get_model(), None);
+    }
+
+    #[test]
+    fn test_completion_request_with_model() {
+        let json = r#"{
+            "model": "text-davinci-003",
+            "prompt": "Hello, world!"
+        }"#;
+
+        let request: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.model.as_deref(), Some("text-davinci-003"));
+        assert_eq!(request.get_model(), Some("text-davinci-003"));
+    }
+
+    #[test]
+    fn test_completion_request_without_model_roundtrip() {
+        let json = r#"{
+            "prompt": "Hello, world!"
+        }"#;
+
+        let request: CompletionRequest = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(!serialized.contains("\"model\""));
+
+        let roundtrip: CompletionRequest = serde_json::from_str(&serialized).unwrap();
+        assert!(roundtrip.model.is_none());
+    }
+
+    #[test]
+    fn test_embedding_request_without_model() {
+        let json = r#"{
+            "input": "Hello, world!"
+        }"#;
+
+        let request: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        assert!(request.model.is_none());
+        assert_eq!(request.get_model(), None);
+    }
+
+    #[test]
+    fn test_embedding_request_with_model() {
+        let json = r#"{
+            "model": "text-embedding-ada-002",
+            "input": "Hello, world!"
+        }"#;
+
+        let request: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.model.as_deref(), Some("text-embedding-ada-002"));
+        assert_eq!(request.get_model(), Some("text-embedding-ada-002"));
+    }
+
+    #[test]
+    fn test_embedding_request_without_model_roundtrip() {
+        let json = r#"{
+            "input": "Hello, world!"
+        }"#;
+
+        let request: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(!serialized.contains("\"model\""));
+
+        let roundtrip: EmbeddingRequest = serde_json::from_str(&serialized).unwrap();
+        assert!(roundtrip.model.is_none());
+    }
+
+    // ==================================================================
     // =            STRUCTURED OUTPUTS PARAMS TESTS                      =
     // ==================================================================
 
