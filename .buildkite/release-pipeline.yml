@@ -1,5 +1,6 @@
 # vLLM Router Release Pipeline
-# This pipeline is triggered on version tags (v*) to build and publish releases
+# This pipeline is triggered on version tags (v*) to build and publish releases.
+# It also supports nightly Docker builds when triggered with NIGHTLY=1.
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -153,3 +154,68 @@ steps:
     soft_fail: false
     agents:
       queue: "cpu_queue_postmerge"
+
+  # ============================================================================
+  # Nightly Docker Images (only when NIGHTLY=1)
+  # Builds multi-arch Docker images and publishes to DockerHub as
+  # vllm/vllm-router:nightly. Triggered daily via scheduled build.
+  # ============================================================================
+  - group: ":docker: Build and push nightly Docker images"
+    key: "build-nightly-docker-images"
+    if: build.env("NIGHTLY") == "1"
+    steps:
+      - label: ":docker: Build and push Docker image - x86_64"
+        depends_on: ~
+        id: build-nightly-docker-x86
+        agents:
+          queue: cpu_queue_postmerge
+        commands:
+          - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-x86_64 --progress plain -f Dockerfile.router ."
+          - "docker push vllm/vllm-router:nightly-x86_64"
+        plugins:
+          - docker-login#v3.0.0:
+              username: vllmbot
+              password-env: DOCKERHUB_TOKEN
+        env:
+          DOCKER_BUILDKIT: "1"
+
+      - label: ":docker: Build and push Docker image - aarch64"
+        depends_on: ~
+        id: build-nightly-docker-arm64
+        agents:
+          queue: arm-cpu
+        commands:
+          - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-aarch64 --progress plain -f Dockerfile.router ."
+          - "docker push vllm/vllm-router:nightly-aarch64"
+        plugins:
+          - docker-login#v3.0.0:
+              username: vllmbot
+              password-env: DOCKERHUB_TOKEN
+        env:
+          DOCKER_BUILDKIT: "1"
+
+  - group: ":shipit: Publish nightly multi-arch manifest"
+    key: "publish-nightly-docker-images"
+    if: build.env("NIGHTLY") == "1"
+    steps:
+      - label: ":rocket: Create and push multi-arch manifest to DockerHub"
+        depends_on:
+          - build-nightly-docker-x86
+          - build-nightly-docker-arm64
+        id: publish-nightly-dockerhub
+        agents:
+          queue: cpu_queue_postmerge
+        commands:
+          # Create and push multi-arch manifests
+          - "docker manifest create vllm/vllm-router:nightly vllm/vllm-router:nightly-x86_64 vllm/vllm-router:nightly-aarch64 --amend"
+          - "docker manifest create vllm/vllm-router:nightly-$$BUILDKITE_COMMIT vllm/vllm-router:nightly-x86_64 vllm/vllm-router:nightly-aarch64 --amend"
+          - "docker manifest push vllm/vllm-router:nightly"
+          - "docker manifest push vllm/vllm-router:nightly-$$BUILDKITE_COMMIT"
+          # Clean up old nightly builds (keep only last 14)
+          - "bash .buildkite/scripts/cleanup-nightly-router-builds.sh"
+        plugins:
+          - docker-login#v3.0.0:
+              username: vllmbot
+              password-env: DOCKERHUB_TOKEN
+        env:
+          DOCKERHUB_USERNAME: "vllmbot"
