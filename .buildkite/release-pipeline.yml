@@ -183,7 +183,7 @@ steps:
         depends_on: ~
         id: build-nightly-docker-arm64
         agents:
-          queue: arm-cpu
+          queue: arm64_cpu_queue_postmerge
         commands:
           - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-aarch64 --progress plain -f Dockerfile.router ."
           - "docker push vllm/vllm-router:nightly-aarch64"
@@ -208,9 +208,9 @@ steps:
         commands:
           # Create and push multi-arch manifests
           - "docker manifest create vllm/vllm-router:nightly vllm/vllm-router:nightly-x86_64 vllm/vllm-router:nightly-aarch64 --amend"
-          - "docker manifest create vllm/vllm-router:nightly-$$BUILDKITE_COMMIT vllm/vllm-router:nightly-x86_64 vllm/vllm-router:nightly-aarch64 --amend"
+          - "docker manifest create vllm/vllm-router:nightly-$$(date +%Y%m%d)-$${BUILDKITE_COMMIT:0:7} vllm/vllm-router:nightly-x86_64 vllm/vllm-router:nightly-aarch64 --amend"
           - "docker manifest push vllm/vllm-router:nightly"
-          - "docker manifest push vllm/vllm-router:nightly-$$BUILDKITE_COMMIT"
+          - "docker manifest push vllm/vllm-router:nightly-$$(date +%Y%m%d)-$${BUILDKITE_COMMIT:0:7}"
           # Clean up old nightly builds (keep only last 14)
           - "bash .buildkite/scripts/cleanup-nightly-router-builds.sh"
         plugins:
