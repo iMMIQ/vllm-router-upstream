@@ -696,25 +696,11 @@ impl VllmPDRouter {
 
         debug!("Added kv_transfer_params to prefill request for NixlConnector support");
 
-        // Extract base URL and dp_rank if intra_node_data_parallel_size > 1
-        let (prefill_base_url, prefill_dp_rank) = if self.intra_node_data_parallel_size > 1 {
-            match dp_utils::extract_dp_rank(prefill_worker.url()) {
-                Ok((base, rank)) => (base.to_string(), Some(rank)),
-                Err(e) => {
-                    return Err(PDRouterError::NetworkError {
-                        message: format!(
-                            "Failed to extract dp_rank from prefill worker URL {}: {}",
-                            prefill_worker.url(),
-                            e
-                        ),
-                    });
-                }
-            }
-        } else {
-            (prefill_worker.url().to_string(), None)
-        };
-
-        let prefill_url = format!("{}{}", prefill_base_url, path);
+        // Use endpoint_url() to get the base URL without @rank suffix,
+        // avoiding IPv6+DP URL corruption (same fix as Router and PDRouter)
+        let prefill_base_url = prefill_worker.base_url().to_string();
+        let prefill_dp_rank = prefill_worker.dp_rank();
+        let prefill_url = prefill_worker.endpoint_url(path);
 
         debug!(
             "🚀 vLLM Stage 1 - Prefill: {} with request_id: {}",
@@ -750,15 +736,11 @@ impl VllmPDRouter {
             )
             .header("X-Request-Id", &request_id);
 
-        // Propagate trace headers
+        // Propagate trace headers and add X-data-parallel-rank header using shared utilities
         prefill_request_builder =
             header_utils::propagate_trace_headers(prefill_request_builder, headers);
-
-        // Add X-data-parallel-rank header if intra_node_data_parallel_size > 1
-        if let Some(rank) = prefill_dp_rank {
-            prefill_request_builder =
-                prefill_request_builder.header("X-data-parallel-rank", rank.to_string());
-        }
+        prefill_request_builder =
+            dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
         let prefill_response = match prefill_request_builder.json(&prefill_request).send().await {
             Ok(resp) => resp,
@@ -854,26 +836,11 @@ impl VllmPDRouter {
             debug!("Added kv_transfer_params to decode request");
         }
 
-        // Extract base URL and dp_rank if intra_node_data_parallel_size > 1
-        let (decode_base_url, decode_dp_rank) = if self.intra_node_data_parallel_size > 1 {
-            match dp_utils::extract_dp_rank(decode_worker.url()) {
-                Ok((base, rank)) => (base.to_string(), Some(rank)),
-                Err(e) => {
-                    decode_worker.decrement_load();
-                    return Err(PDRouterError::NetworkError {
-                        message: format!(
-                            "Failed to extract dp_rank from decode worker URL {}: {}",
-                            decode_worker.url(),
-                            e
-                        ),
-                    });
-                }
-            }
-        } else {
-            (decode_worker.url().to_string(), None)
-        };
-
-        let decode_url = format!("{}{}", decode_base_url, path);
+        // Use endpoint_url() to get the base URL without @rank suffix,
+        // avoiding IPv6+DP URL corruption (same fix as Router and PDRouter)
+        let decode_base_url = decode_worker.base_url().to_string();
+        let decode_dp_rank = decode_worker.dp_rank();
+        let decode_url = decode_worker.endpoint_url(path);
 
         debug!(
             "🚀 vLLM Stage 2 - Decode: {} with request_id: {}",
@@ -909,15 +876,11 @@ impl VllmPDRouter {
             )
             .header("X-Request-Id", &request_id);
 
-        // Propagate trace headers
+        // Propagate trace headers and add X-data-parallel-rank header using shared utilities
         decode_request_builder =
             header_utils::propagate_trace_headers(decode_request_builder, headers);
-
-        // Add X-data-parallel-rank header if intra_node_data_parallel_size > 1
-        if let Some(rank) = decode_dp_rank {
-            decode_request_builder =
-                decode_request_builder.header("X-data-parallel-rank", rank.to_string());
-        }
+        decode_request_builder =
+            dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
         let decode_response = match decode_request_builder.json(&decode_request).send().await {
             Ok(resp) => resp,
