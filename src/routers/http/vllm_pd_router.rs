@@ -667,8 +667,9 @@ impl VllmPDRouter {
         // Increment prefill load at the start of the prefill phase
         prefill_worker.increment_load();
 
-        let prefill_zmq_addr = self.get_zmq_address(prefill_worker.url(), ServiceType::Prefill);
-        let decode_zmq_addr = self.get_zmq_address(decode_worker.url(), ServiceType::Decode);
+        let prefill_zmq_addr =
+            self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
+        let decode_zmq_addr = self.get_zmq_address(decode_worker.base_url(), ServiceType::Decode);
         let request_id = Self::generate_vllm_request_id(&prefill_zmq_addr, &decode_zmq_addr);
 
         debug!("Generated vLLM request ID: {}", request_id);

@@ -39,6 +39,9 @@ GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.6}
 PREFILL_BLOCK_SIZE=${PREFILL_BLOCK_SIZE:-128}
 DECODE_BLOCK_SIZE=${DECODE_BLOCK_SIZE:-128}
 
+# Intra-node data parallel size (exercises DP-aware routing)
+INTRA_NODE_DP_SIZE=${INTRA_NODE_DP_SIZE:-2}
+
 # Port configuration
 PREFILL_BASE_PORT=${PREFILL_BASE_PORT:-8100}
 DECODE_BASE_PORT=${DECODE_BASE_PORT:-8200}
@@ -151,9 +154,10 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES - 1))); do
   NIXL_PORT=$((PREFILL_NIXL_BASE_PORT + i))
   NIXL_HTTP_PORT=$((PREFILL_NIXL_HTTP_BASE_PORT + i))
 
-  # Calculate GPU IDs for this instance
-  GPU_START=$((i * PREFILLER_TP_SIZE))
-  GPU_END=$((GPU_START + PREFILLER_TP_SIZE - 1))
+  # Calculate GPU IDs for this instance (TP * DP GPUs per instance)
+  PREFILL_GPUS_PER_INSTANCE=$((PREFILLER_TP_SIZE * INTRA_NODE_DP_SIZE))
+  GPU_START=$((i * PREFILL_GPUS_PER_INSTANCE))
+  GPU_END=$((GPU_START + PREFILL_GPUS_PER_INSTANCE - 1))
   GPU_IDS=$(seq -s, $GPU_START $GPU_END)
 
   # Build instance-specific KV config with HTTP port
@@ -177,6 +181,7 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES - 1))); do
     --port $PORT \
     --block-size ${PREFILL_BLOCK_SIZE} \
     --gpu-memory-utilization $GPU_MEMORY_UTILIZATION \
+    --data-parallel-size $INTRA_NODE_DP_SIZE \
     --enable-prefix-caching \
     --enforce-eager \
     --disable-hybrid-kv-cache-manager \
@@ -199,8 +204,10 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES - 1))); do
   NIXL_HTTP_PORT=$((DECODE_NIXL_HTTP_BASE_PORT + i))
 
   # Calculate GPU IDs for decode instances (after prefill GPUs)
-  GPU_START=$(( (NUM_PREFILL_INSTANCES * PREFILLER_TP_SIZE) + (i * DECODER_TP_SIZE) ))
-  GPU_END=$((GPU_START + DECODER_TP_SIZE - 1))
+  PREFILL_TOTAL_GPUS=$((NUM_PREFILL_INSTANCES * PREFILLER_TP_SIZE * INTRA_NODE_DP_SIZE))
+  DECODE_GPUS_PER_INSTANCE=$((DECODER_TP_SIZE * INTRA_NODE_DP_SIZE))
+  GPU_START=$(( PREFILL_TOTAL_GPUS + (i * DECODE_GPUS_PER_INSTANCE) ))
+  GPU_END=$((GPU_START + DECODE_GPUS_PER_INSTANCE - 1))
   GPU_IDS=$(seq -s, $GPU_START $GPU_END)
 
   # Build instance-specific KV config with HTTP port
@@ -224,6 +231,7 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES - 1))); do
     --port $PORT \
     --block-size ${DECODE_BLOCK_SIZE} \
     --gpu-memory-utilization $GPU_MEMORY_UTILIZATION \
+    --data-parallel-size $INTRA_NODE_DP_SIZE \
     --disable-hybrid-kv-cache-manager \
     --disable-log-stats \
     --kv-transfer-config "$INSTANCE_KV_CONFIG" \
@@ -316,6 +324,7 @@ vllm-router \
   --port "$ROUTER_PORT" \
   --policy power_of_two \
   --vllm-pd-disaggregation \
+  --intra-node-data-parallel-size "$INTRA_NODE_DP_SIZE" \
   $PREFILL_ARGS \
   $DECODE_ARGS \
   --worker-startup-check-interval 1 \

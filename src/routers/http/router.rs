@@ -1,7 +1,7 @@
 use crate::config::types::RetryConfig;
 use crate::core::{
-    is_retryable_status, BasicWorker, CircuitBreakerConfig, HealthConfig, RetryExecutor, Worker,
-    WorkerRegistry, WorkerType,
+    is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
+    RetryExecutor, Worker, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
@@ -91,20 +91,36 @@ impl Router {
 
         // Register workers in the registry
         // In IGW mode, we need to fetch model info from workers
+        let dp_size = ctx.router_config.intra_node_data_parallel_size;
+        let health_config = HealthConfig {
+            timeout_secs: ctx.router_config.health_check.timeout_secs,
+            check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+            endpoint: ctx.router_config.health_check.endpoint.clone(),
+            failure_threshold: ctx.router_config.health_check.failure_threshold,
+            success_threshold: ctx.router_config.health_check.success_threshold,
+        };
         for url in &worker_urls {
             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
             // For now, create worker without model_id
-            let worker = BasicWorker::new(url.clone(), WorkerType::Regular)
-                .with_circuit_breaker_config(core_cb_config.clone())
-                .with_health_config(HealthConfig {
-                    timeout_secs: ctx.router_config.health_check.timeout_secs,
-                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                    endpoint: ctx.router_config.health_check.endpoint.clone(),
-                    failure_threshold: ctx.router_config.health_check.failure_threshold,
-                    success_threshold: ctx.router_config.health_check.success_threshold,
-                });
-
-            let worker_arc = Arc::new(worker);
+            let worker_arc: Arc<dyn Worker> = if dp_size > 1 {
+                let (base_url, dp_rank) = dp_utils::parse_worker_url(url);
+                Arc::new(
+                    DPAwareWorker::new(
+                        base_url,
+                        dp_rank.unwrap_or(0),
+                        dp_size,
+                        WorkerType::Regular,
+                    )
+                    .with_circuit_breaker_config(core_cb_config.clone())
+                    .with_health_config(health_config.clone()),
+                )
+            } else {
+                Arc::new(
+                    BasicWorker::new(url.clone(), WorkerType::Regular)
+                        .with_circuit_breaker_config(core_cb_config.clone())
+                        .with_health_config(health_config.clone()),
+                )
+            };
             ctx.worker_registry.register(worker_arc.clone());
 
             // Notify PolicyRegistry about the new worker
@@ -978,13 +994,16 @@ impl Router {
                                 }
                                 info!("Added worker: {}", dp_url);
                                 // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-                                let new_worker =
-                                    BasicWorker::new(dp_url.to_string(), WorkerType::Regular)
-                                        .with_circuit_breaker_config(
-                                            self.circuit_breaker_config.clone(),
-                                        );
+                                let (base_url, dp_rank) = dp_utils::parse_worker_url(dp_url);
+                                let new_worker = DPAwareWorker::new(
+                                    base_url,
+                                    dp_rank.unwrap_or(0),
+                                    self.intra_node_data_parallel_size,
+                                    WorkerType::Regular,
+                                )
+                                .with_circuit_breaker_config(self.circuit_breaker_config.clone());
 
-                                let worker_arc = Arc::new(new_worker);
+                                let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                                 self.worker_registry.register(worker_arc.clone());
 
                                 // Notify PolicyRegistry about the new worker

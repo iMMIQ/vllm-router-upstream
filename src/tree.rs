@@ -2235,9 +2235,17 @@ mod tests {
             }
         }
 
-        // Verify char count consistency
-        let maintained = get_maintained_counts(&tree);
-        let computed = tree.get_used_size_per_tenant();
+        // Verify char count consistency (filter out zero-count entries like "empty"
+        // which appear in DFS traversal but not in the incremental counter)
+        let maintained: HashMap<String, usize> = get_maintained_counts(&tree)
+            .into_iter()
+            .filter(|(_, v)| *v > 0)
+            .collect();
+        let computed: HashMap<String, usize> = tree
+            .get_used_size_per_tenant()
+            .into_iter()
+            .filter(|(_, v)| *v > 0)
+            .collect();
         assert_eq!(
             maintained, computed,
             "Counts should be consistent after stress test"

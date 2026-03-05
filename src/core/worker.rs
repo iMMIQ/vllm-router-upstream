@@ -570,6 +570,18 @@ impl DPAwareWorker {
             base_url,
         }
     }
+
+    /// Configure the circuit breaker for this worker
+    pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
+        self.base_worker = self.base_worker.with_circuit_breaker_config(config);
+        self
+    }
+
+    /// Configure health check settings for this worker
+    pub fn with_health_config(mut self, config: HealthConfig) -> Self {
+        self.base_worker = self.base_worker.with_health_config(config);
+        self
+    }
 }
 
 #[async_trait]
@@ -1717,6 +1729,63 @@ mod tests {
         assert_eq!(dp_worker.dp_rank(), Some(2));
         assert_eq!(dp_worker.dp_size(), Some(4));
         assert!(dp_worker.is_dp_aware());
+    }
+
+    #[test]
+    fn test_dp_aware_endpoint_url_hostname_port() {
+        // Regression test: hostname:port URLs with @rank suffix must NOT be parsed
+        // as HTTP userinfo (user:pass@host). Using DPAwareWorker ensures that
+        // endpoint_url() uses the clean base_url without @rank.
+        let dp_worker =
+            DPAwareWorker::new("http://node1:8087".to_string(), 1, 4, WorkerType::Regular);
+
+        // url() includes @rank for identification
+        assert_eq!(dp_worker.url(), "http://node1:8087@1");
+
+        // base_url() is clean — no @rank suffix
+        assert_eq!(dp_worker.base_url(), "http://node1:8087");
+
+        // endpoint_url() must produce a URL without @rank to avoid userinfo parsing
+        // (http://node1:8087@1/v1/completions would be parsed as user=node1, pass=8087, host=1)
+        assert_eq!(
+            dp_worker.endpoint_url("/v1/completions"),
+            "http://node1:8087/v1/completions"
+        );
+
+        assert_eq!(dp_worker.dp_rank(), Some(1));
+        assert_eq!(dp_worker.dp_size(), Some(4));
+        assert!(dp_worker.is_dp_aware());
+    }
+
+    #[test]
+    fn test_dp_aware_worker_with_configs() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            success_threshold: 1,
+            timeout_duration: std::time::Duration::from_secs(30),
+            window_duration: std::time::Duration::from_secs(60),
+        };
+        let health = HealthConfig {
+            timeout_secs: 10,
+            check_interval_secs: 5,
+            endpoint: "/health".to_string(),
+            failure_threshold: 3,
+            success_threshold: 1,
+        };
+
+        let dp_worker =
+            DPAwareWorker::new("http://node1:8087".to_string(), 2, 4, WorkerType::Decode)
+                .with_circuit_breaker_config(config)
+                .with_health_config(health);
+
+        assert_eq!(dp_worker.base_url(), "http://node1:8087");
+        assert_eq!(
+            dp_worker.endpoint_url("/v1/completions"),
+            "http://node1:8087/v1/completions"
+        );
+        assert_eq!(dp_worker.dp_rank(), Some(2));
+        assert_eq!(dp_worker.metadata().health_config.timeout_secs, 10);
+        assert!(dp_worker.is_available());
     }
 
     #[test]
