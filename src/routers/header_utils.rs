@@ -57,13 +57,27 @@ pub const TRACE_HEADER_NAMES: &[&str] = &["traceparent", "tracestate", "baggage"
 
 /// Propagate OpenTelemetry trace headers to a reqwest RequestBuilder
 ///
-/// This enables distributed tracing across service boundaries by forwarding
-/// W3C Trace Context headers from incoming requests to outgoing backend requests.
+/// When OTel is enabled: actively injects the current span's trace context,
+/// making the router's span the parent of the backend request's span.
+/// When OTel is disabled: passively forwards existing trace headers from
+/// the incoming request.
 pub fn propagate_trace_headers(
     request: reqwest::RequestBuilder,
     headers: Option<&HeaderMap>,
 ) -> reqwest::RequestBuilder {
-    propagate_headers(request, headers, TRACE_HEADER_NAMES)
+    if crate::otel_trace::is_otel_enabled() {
+        // Active injection: use the current span's context
+        let mut trace_headers = HeaderMap::new();
+        crate::otel_trace::inject_trace_context_http(&mut trace_headers);
+        let mut req = request;
+        for (k, v) in trace_headers.iter() {
+            req = req.header(k, v);
+        }
+        req
+    } else {
+        // Passive forwarding: copy existing trace headers from incoming request
+        propagate_headers(request, headers, TRACE_HEADER_NAMES)
+    }
 }
 
 /// Propagate specific headers from incoming request to outgoing reqwest RequestBuilder

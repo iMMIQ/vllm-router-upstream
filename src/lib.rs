@@ -16,6 +16,7 @@ pub mod server;
 pub mod service_discovery;
 pub mod tokenizer;
 pub mod tree;
+pub mod otel_trace;
 use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig,
-    RoutingMode,
+    RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -206,6 +206,14 @@ struct CliArgs {
     /// Set the logging level
     #[arg(long, default_value = "info", value_parser = ["debug", "info", "warn", "error"])]
     log_level: String,
+
+    /// Enable OpenTelemetry tracing
+    #[arg(long, default_value_t = false, help_heading = "Tracing (OpenTelemetry)")]
+    enable_trace: bool,
+
+    /// OTLP collector endpoint (format: host:port)
+    #[arg(long, default_value = "localhost:4317", help_heading = "Tracing (OpenTelemetry)")]
+    otlp_traces_endpoint: String,
 
     /// Enable Kubernetes service discovery
     #[arg(long, default_value_t = false)]
@@ -675,6 +683,14 @@ impl CliArgs {
             } else {
                 Some(self.request_id_headers.clone())
             },
+            trace_config: if self.enable_trace {
+                Some(TraceConfig {
+                    enable_trace: true,
+                    otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+                })
+            } else {
+                None
+            },
         }
     }
 }
@@ -791,6 +807,10 @@ Provide --worker-urls or PD flags as usual.",
     // Block on the async startup function
     println!("DEBUG: Starting server startup function");
     runtime.block_on(async move { server::startup(server_config).await })?;
+
+    if vllm_router_rs::otel_trace::is_otel_enabled() {
+        vllm_router_rs::otel_trace::shutdown_otel();
+    }
 
     Ok(())
 }

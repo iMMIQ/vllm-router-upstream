@@ -1,5 +1,6 @@
+use crate::otel_trace;
 use crate::{
-    config::{ConnectionMode, HistoryBackend, RouterConfig},
+    config::{ConnectionMode, HistoryBackend, RouterConfig, TraceConfig},
     core::{WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
@@ -696,6 +697,7 @@ pub struct ServerConfig {
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
+    pub trace_config: Option<TraceConfig>,
 }
 
 /// Build the Axum application with all routes and middleware
@@ -784,6 +786,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Only initialize logging if not already done (for Python bindings support)
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+    if let Some(trace_config) = &config.trace_config {
+        if let Err(e) = otel_trace::otel_tracing_init(
+            trace_config.enable_trace,
+            Some(&trace_config.otlp_traces_endpoint),
+        ) {
+            eprintln!("Failed to initialize OpenTelemetry: {e}");
+        }
+    }
+
     println!("DEBUG: Initializing logging");
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
         Some(logging::init_logging(LoggingConfig {
@@ -803,7 +814,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             colorize: true,
             log_file_name: "vllm-router".to_string(),
             log_targets: None,
-        }))
+        }, config.trace_config.clone()))
     } else {
         None
     };

@@ -8,6 +8,9 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
+use crate::config::TraceConfig;
+use crate::otel_trace::get_otel_layer;
+
 /// Configuration for the logging system
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
@@ -57,7 +60,7 @@ pub struct LogGuard {
 ///
 /// # Panics
 /// Will not panic, as initialization errors are handled gracefully
-pub fn init_logging(config: LoggingConfig) -> LogGuard {
+pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig>) -> LogGuard {
     // Forward logs to tracing - ignore errors to allow for multiple initialization
     let _ = LogTracer::init();
 
@@ -147,6 +150,19 @@ pub fn init_logging(config: LoggingConfig) -> LogGuard {
         };
 
         layers.push(file_layer);
+    }
+
+    if let Some(otel_layer_config) = &otel_layer_config {
+        if otel_layer_config.enable_trace {
+            match get_otel_layer() {
+                Ok(otel_layer) => {
+                    layers.push(otel_layer);
+                }
+                Err(e) => {
+                    eprintln!("Failed to initialize OpenTelemetry layer: {e}");
+                }
+            }
+        }
     }
 
     // Initialize the subscriber with all layers

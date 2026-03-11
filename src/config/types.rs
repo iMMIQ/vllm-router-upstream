@@ -406,6 +406,24 @@ impl Default for MetricsConfig {
     }
 }
 
+/// OpenTelemetry tracing configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceConfig {
+    /// Whether to enable OpenTelemetry tracing
+    pub enable_trace: bool,
+    /// OTLP collector endpoint (format: host:port)
+    pub otlp_traces_endpoint: String,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self {
+            enable_trace: false,
+            otlp_traces_endpoint: "localhost:4317".to_string(),
+        }
+    }
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
