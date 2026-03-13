@@ -177,7 +177,7 @@ impl ConfigValidator {
     /// Validate policy configuration
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin => {
+            PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::WeightedRoundRobin => {
                 // No specific validation needed
             }
             PolicyConfig::CacheAware {

@@ -246,6 +246,7 @@ impl Router {
             history_backend: config::HistoryBackend::Memory,
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout
+            worker_weights: std::collections::HashMap::new(),
         })
     }
 }

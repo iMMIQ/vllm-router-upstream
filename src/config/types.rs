@@ -81,6 +81,10 @@ pub struct RouterConfig {
     /// Profiling timeout in seconds (for vLLM profiling endpoints)
     #[serde(default = "default_profile_timeout_secs")]
     pub profile_timeout_secs: u64,
+    /// Worker weights for weighted load balancing (URL -> weight).
+    /// Used by the weighted_round_robin policy to distribute requests proportionally.
+    #[serde(default)]
+    pub worker_weights: HashMap<String, u32>,
 }
 
 fn default_profile_timeout_secs() -> u64 {
@@ -254,6 +258,9 @@ pub enum PolicyConfig {
         /// Number of virtual nodes per worker for better distribution
         virtual_nodes: u32,
     },
+
+    #[serde(rename = "weighted_round_robin")]
+    WeightedRoundRobin,
 }
 
 impl PolicyConfig {
@@ -264,6 +271,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
+            PolicyConfig::WeightedRoundRobin => "weighted_round_robin",
         }
     }
 }
@@ -444,6 +452,7 @@ impl Default for RouterConfig {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            worker_weights: HashMap::new(),
         }
     }
 }
@@ -1015,6 +1024,7 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            worker_weights: HashMap::new(),
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1082,6 +1092,7 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            worker_weights: HashMap::new(),
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1145,6 +1156,7 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            worker_weights: HashMap::new(),
         };
 
         assert!(config.has_service_discovery());

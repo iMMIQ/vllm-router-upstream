@@ -2,7 +2,7 @@
 
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
+    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy, WeightedRoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -38,6 +38,7 @@ impl PolicyFactory {
                 // The consistent hash policy uses a hardcoded value for now
                 Arc::new(ConsistentHashPolicy::new())
             }
+            PolicyConfig::WeightedRoundRobin => Arc::new(WeightedRoundRobinPolicy::new()),
         }
     }
 
@@ -49,6 +50,9 @@ impl PolicyFactory {
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
+            "weighted_round_robin" | "weightedroundrobin" => {
+                Some(Arc::new(WeightedRoundRobinPolicy::new()))
+            }
             _ => None,
         }
     }
@@ -88,6 +92,10 @@ mod tests {
         let policy =
             PolicyFactory::create_from_config(&PolicyConfig::ConsistentHash { virtual_nodes: 160 });
         assert_eq!(policy.name(), "consistent_hash");
+
+        // Test WeightedRoundRobin
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::WeightedRoundRobin);
+        assert_eq!(policy.name(), "weighted_round_robin");
     }
 
     #[test]
@@ -102,6 +110,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
         assert!(PolicyFactory::create_by_name("consistent_hash").is_some());
         assert!(PolicyFactory::create_by_name("ConsistentHash").is_some());
+        assert!(PolicyFactory::create_by_name("weighted_round_robin").is_some());
+        assert!(PolicyFactory::create_by_name("WeightedRoundRobin").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 }

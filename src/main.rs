@@ -1,4 +1,4 @@
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
@@ -8,6 +8,37 @@ use vllm_router_rs::config::{
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
 use vllm_router_rs::service_discovery::ServiceDiscoveryConfig;
+
+// Helper function to parse decode arguments from command line
+// Returns decode_entries with (URL, optional_weight)
+fn parse_decode_args() -> Vec<(String, Option<u32>)> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut decode_entries = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        if args[i] == "--decode" && i + 1 < args.len() {
+            let url = args[i + 1].clone();
+
+            let weight = if i + 2 < args.len() && !args[i + 2].starts_with("--") {
+                if let Ok(w) = args[i + 2].parse::<u32>() {
+                    i += 1; // Skip the weight argument
+                    Some(w)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            decode_entries.push((url, weight));
+            i += 2; // Skip --decode and URL
+        } else {
+            i += 1;
+        }
+    }
+
+    decode_entries
+}
 
 // Helper function to parse prefill arguments from command line
 // Returns prefill_entries with (URL, optional_bootstrap_port)
@@ -123,7 +154,7 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "weighted_round_robin"])]
     policy: String,
 
     /// Enable PD (Prefill-Decode) disaggregated mode
@@ -139,16 +170,17 @@ struct CliArgs {
     #[arg(long)]
     vllm_discovery_address: Option<String>,
 
-    /// Decode server URL (can be specified multiple times)
-    #[arg(long, action = ArgAction::Append)]
-    decode: Vec<String>,
+    /// Decode server URLs are parsed manually (--decode URL [WEIGHT])
+    /// This field is unused; decode args are parsed by parse_decode_args()
+    #[arg(skip)]
+    _decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "weighted_round_robin"])]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "weighted_round_robin"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -389,6 +421,7 @@ impl CliArgs {
             "consistent_hash" => PolicyConfig::ConsistentHash {
                 virtual_nodes: 160, // Default value
             },
+            "weighted_round_robin" => PolicyConfig::WeightedRoundRobin,
             _ => PolicyConfig::RoundRobin, // Fallback
         }
     }
@@ -397,6 +430,7 @@ impl CliArgs {
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
+        decode_args: Vec<(String, Option<u32>)>,
     ) -> ConfigResult<RouterConfig> {
         // Validate mutually exclusive modes
         if self.pd_disaggregation && self.vllm_pd_disaggregation {
@@ -418,7 +452,7 @@ impl CliArgs {
                 worker_urls: self.worker_urls.clone(),
             }
         } else if self.pd_disaggregation {
-            let decode_urls = self.decode.clone();
+            let decode_urls: Vec<String> = decode_args.iter().map(|(url, _)| url.clone()).collect();
 
             // Validate PD configuration if not using service discovery
             if !self.service_discovery && (prefill_urls.is_empty() || decode_urls.is_empty()) {
@@ -434,8 +468,8 @@ impl CliArgs {
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }
         } else if self.vllm_pd_disaggregation {
-            // Use decode URLs from CLI arguments (already parsed by clap)
-            let decode_urls = &self.decode;
+            // Use decode URLs from CLI arguments (already parsed manually)
+            let decode_urls: Vec<String> = decode_args.iter().map(|(url, _)| url.clone()).collect();
 
             // Support multiple discovery/configuration modes:
             // 1. Static URLs (--prefill/--decode)
@@ -453,7 +487,7 @@ impl CliArgs {
             }
 
             // Use decode URLs directly from CLI
-            let final_decode_urls = decode_urls.clone();
+            let final_decode_urls = decode_urls;
 
             // Log the discovery/configuration mode being used
             if use_k8s_discovery {
@@ -631,6 +665,10 @@ impl CliArgs {
             },
             enable_profiling: self.profile,
             profile_timeout_secs: 10, // Default profiling timeout
+            worker_weights: decode_args
+                .iter()
+                .filter_map(|(url, weight)| weight.map(|w| (url.clone(), w)))
+                .collect(),
         })
     }
 
@@ -683,12 +721,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     println!("DEBUG: Main function started");
 
-    // Parse prefill arguments manually before clap parsing
+    // Parse prefill and decode arguments manually before clap parsing
     println!("DEBUG: Parsing prefill arguments");
     let prefill_urls = parse_prefill_args();
     println!("DEBUG: Prefill URLs parsed: {:?}", prefill_urls);
 
-    // Filter out prefill arguments and their values before passing to clap
+    println!("DEBUG: Parsing decode arguments");
+    let decode_args = parse_decode_args();
+    println!("DEBUG: Decode args parsed: {:?}", decode_args);
+
+    // Filter out prefill and decode arguments and their values before passing to clap
     println!("DEBUG: Filtering CLI arguments");
     let mut filtered_args: Vec<String> = Vec::new();
     let raw_args: Vec<String> = std::env::args().collect();
@@ -704,6 +746,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if i < raw_args.len()
                 && !raw_args[i].starts_with("--")
                 && (raw_args[i].parse::<u16>().is_ok() || raw_args[i].to_lowercase() == "none")
+            {
+                i += 1;
+            }
+        } else if raw_args[i] == "--decode" && i + 1 < raw_args.len() {
+            // Skip --decode and its URL
+            i += 2;
+
+            // Also skip weight if present
+            if i < raw_args.len()
+                && !raw_args[i].starts_with("--")
+                && raw_args[i].parse::<u32>().is_ok()
             {
                 i += 1;
             }
@@ -757,13 +810,14 @@ Provide --worker-urls or PD flags as usual.",
 
         if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
             println!("Prefill nodes: {:?}", prefill_urls);
-            println!("Decode nodes: {:?}", cli_args.decode);
+            let decode_urls: Vec<&str> = decode_args.iter().map(|(url, _)| url.as_str()).collect();
+            println!("Decode nodes: {:?}", decode_urls);
         }
     }
 
     // Convert to RouterConfig
     println!("DEBUG: Converting to RouterConfig");
-    let router_config = cli_args.to_router_config(prefill_urls)?;
+    let router_config = cli_args.to_router_config(prefill_urls, decode_args)?;
     println!("DEBUG: RouterConfig created successfully");
 
     // Validate configuration

@@ -197,6 +197,15 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .unwrap_or(1.0)
     }
 
+    /// Get the weight of this worker for weighted load balancing (higher = more capacity)
+    fn weight(&self) -> u32 {
+        self.metadata()
+            .labels
+            .get("weight")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+    }
+
     /// Get the tokenizer path for this worker (gRPC mode only)
     fn tokenizer_path(&self) -> Option<&str> {
         self.metadata()
@@ -580,6 +589,12 @@ impl DPAwareWorker {
     /// Configure health check settings for this worker
     pub fn with_health_config(mut self, config: HealthConfig) -> Self {
         self.base_worker = self.base_worker.with_health_config(config);
+        self
+    }
+
+    /// Set labels for this worker (delegates to underlying BasicWorker)
+    pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
+        self.base_worker = self.base_worker.with_labels(labels);
         self
     }
 }

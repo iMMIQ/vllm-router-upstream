@@ -535,19 +535,41 @@ impl PDRouter {
         // Register decode workers in the registry
         for url in expanded_decode_urls {
             decode_workers_urls.push(url.clone());
+            // Build weight labels if a weight is configured for this worker
+            let weight_labels = {
+                // For DP workers, look up by base_url; otherwise by the full url
+                let lookup_url = if dp_size > 1 {
+                    dp_utils::parse_worker_url(&url).0.to_string()
+                } else {
+                    url.clone()
+                };
+                ctx.router_config
+                    .worker_weights
+                    .get(&lookup_url)
+                    .map(|w| {
+                        let mut labels = std::collections::HashMap::new();
+                        labels.insert("weight".to_string(), w.to_string());
+                        labels
+                    })
+            };
             let worker: Arc<dyn Worker> = if dp_size > 1 {
                 let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-                Arc::new(
+                let mut w =
                     DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), dp_size, WorkerType::Decode)
                         .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
-                )
+                        .with_health_config(health_config.clone());
+                if let Some(labels) = weight_labels {
+                    w = w.with_labels(labels);
+                }
+                Arc::new(w)
             } else {
-                Arc::new(
-                    BasicWorker::new(url, WorkerType::Decode)
-                        .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
-                )
+                let mut w = BasicWorker::new(url, WorkerType::Decode)
+                    .with_circuit_breaker_config(core_cb_config.clone())
+                    .with_health_config(health_config.clone());
+                if let Some(labels) = weight_labels {
+                    w = w.with_labels(labels);
+                }
+                Arc::new(w)
             };
             ctx.worker_registry.register(worker);
         }
