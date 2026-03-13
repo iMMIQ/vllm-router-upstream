@@ -590,28 +590,31 @@ impl PDRouter {
         let prefill_policy = ctx.policy_registry.get_prefill_policy();
         let decode_policy = ctx.policy_registry.get_decode_policy();
 
-        let load_monitor_handle =
-            if prefill_policy.name() == "power_of_two" || decode_policy.name() == "power_of_two" {
-                let monitor_urls = all_urls.clone();
-                let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
-                let monitor_client = ctx.client.clone();
-                let prefill_policy_clone = Arc::clone(&prefill_policy);
-                let decode_policy_clone = Arc::clone(&decode_policy);
+        let needs_load_monitoring =
+            |name: &str| -> bool { matches!(name, "power_of_two" | "dynamic_scoring") };
+        let load_monitor_handle = if needs_load_monitoring(prefill_policy.name())
+            || needs_load_monitoring(decode_policy.name())
+        {
+            let monitor_urls = all_urls.clone();
+            let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
+            let monitor_client = ctx.client.clone();
+            let prefill_policy_clone = Arc::clone(&prefill_policy);
+            let decode_policy_clone = Arc::clone(&decode_policy);
 
-                Some(Arc::new(tokio::spawn(async move {
-                    Self::monitor_worker_loads_with_client(
-                        monitor_urls,
-                        tx,
-                        monitor_interval,
-                        monitor_client,
-                        prefill_policy_clone,
-                        decode_policy_clone,
-                    )
-                    .await;
-                })))
-            } else {
-                None
-            };
+            Some(Arc::new(tokio::spawn(async move {
+                Self::monitor_worker_loads_with_client(
+                    monitor_urls,
+                    tx,
+                    monitor_interval,
+                    monitor_client,
+                    prefill_policy_clone,
+                    decode_policy_clone,
+                )
+                .await;
+            })))
+        } else {
+            None
+        };
 
         // Note: Health checking is now handled centrally by RouterManager
         // Individual routers no longer need to manage health checkers
@@ -1757,11 +1760,11 @@ impl PDRouter {
 // Helper functions
 
 async fn get_worker_load(client: &Client, worker_url: &str) -> Option<isize> {
-    match client.get(format!("{}/get_load", worker_url)).send().await {
+    match client.get(format!("{}/load", worker_url)).send().await {
         Ok(res) if res.status().is_success() => match res.bytes().await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(data) => data
-                    .get("load")
+                    .get("server_load")
                     .and_then(|v| v.as_i64())
                     .map(|v| v as isize),
                 Err(e) => {

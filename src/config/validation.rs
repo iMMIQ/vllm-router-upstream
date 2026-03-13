@@ -239,6 +239,26 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::DynamicScoring {
+                default_safe_capacity,
+                load_check_interval_secs,
+                ..
+            } => {
+                if *default_safe_capacity <= 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "default_safe_capacity".to_string(),
+                        value: default_safe_capacity.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+                if *load_check_interval_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "load_check_interval_secs".to_string(),
+                        value: load_check_interval_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }

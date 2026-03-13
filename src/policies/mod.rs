@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 mod cache_aware;
 mod consistent_hash;
+mod dynamic_scoring;
 mod factory;
 mod power_of_two;
 mod random;
@@ -18,6 +19,7 @@ mod round_robin;
 
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hash::ConsistentHashPolicy;
+pub use dynamic_scoring::{DynamicScoringConfig, DynamicScoringPolicy};
 pub use factory::PolicyFactory;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;

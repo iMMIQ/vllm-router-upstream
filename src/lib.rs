@@ -26,6 +26,7 @@ pub enum PolicyType {
     CacheAware,
     PowerOfTwo,
     ConsistentHash,
+    DynamicScoring,
 }
 
 #[pyclass]
@@ -136,6 +137,14 @@ impl Router {
                 },
                 PolicyType::ConsistentHash => ConfigPolicyConfig::ConsistentHash {
                     virtual_nodes: 160, // Default value
+                },
+                PolicyType::DynamicScoring => ConfigPolicyConfig::DynamicScoring {
+                    default_safe_capacity: 100.0,
+                    alpha: 1.0,
+                    beta: 0.0,
+                    gamma: 0.0,
+                    load_check_interval_secs: 5,
+                    worker_safe_capacities: HashMap::new(),
                 },
             }
         };

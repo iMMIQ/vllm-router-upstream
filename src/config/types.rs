@@ -254,6 +254,22 @@ pub enum PolicyConfig {
         /// Number of virtual nodes per worker for better distribution
         virtual_nodes: u32,
     },
+
+    #[serde(rename = "dynamic_scoring")]
+    DynamicScoring {
+        /// Default safe capacity for workers without explicit configuration
+        default_safe_capacity: f64,
+        /// Weight for normalized queue depth component
+        alpha: f64,
+        /// Weight for latency component (reserved for future use)
+        beta: f64,
+        /// Weight for error penalty component (reserved for future use)
+        gamma: f64,
+        /// Interval for load monitoring (seconds)
+        load_check_interval_secs: u64,
+        /// Per-worker safe capacity overrides (URL -> capacity)
+        worker_safe_capacities: HashMap<String, f64>,
+    },
 }
 
 impl PolicyConfig {
@@ -264,6 +280,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
+            PolicyConfig::DynamicScoring { .. } => "dynamic_scoring",
         }
     }
 }

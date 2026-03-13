@@ -1,8 +1,8 @@
 //! Factory for creating load balancing policies
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, DynamicScoringConfig,
+    DynamicScoringPolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -38,6 +38,23 @@ impl PolicyFactory {
                 // The consistent hash policy uses a hardcoded value for now
                 Arc::new(ConsistentHashPolicy::new())
             }
+            PolicyConfig::DynamicScoring {
+                default_safe_capacity,
+                alpha,
+                beta,
+                gamma,
+                worker_safe_capacities,
+                ..
+            } => {
+                let config = DynamicScoringConfig {
+                    default_safe_capacity: *default_safe_capacity,
+                    alpha: *alpha,
+                    beta: *beta,
+                    gamma: *gamma,
+                    worker_safe_capacities: worker_safe_capacities.clone(),
+                };
+                Arc::new(DynamicScoringPolicy::with_config(config))
+            }
         }
     }
 
@@ -49,6 +66,7 @@ impl PolicyFactory {
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
+            "dynamic_scoring" | "dynamicscoring" => Some(Arc::new(DynamicScoringPolicy::new())),
             _ => None,
         }
     }

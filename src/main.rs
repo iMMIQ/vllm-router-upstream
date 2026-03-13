@@ -123,7 +123,7 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "dynamic_scoring"])]
     policy: String,
 
     /// Enable PD (Prefill-Decode) disaggregated mode
@@ -144,11 +144,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "dynamic_scoring"])]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "dynamic_scoring"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -343,6 +343,27 @@ struct CliArgs {
     /// Enable profiling calls to vLLM workers
     #[arg(long, default_value_t = false)]
     profile: bool,
+
+    /// Comma-separated safe capacities for decode workers (positional mapping to --decode args).
+    /// Used with --decode-policy dynamic_scoring.
+    #[arg(long, value_delimiter = ',')]
+    decode_safe_capacities: Vec<f64>,
+
+    /// Default safe capacity for workers without explicit configuration (dynamic_scoring policy)
+    #[arg(long, default_value_t = 100.0)]
+    dynamic_scoring_default_safe_capacity: f64,
+
+    /// Alpha weight for normalized queue depth in dynamic_scoring policy
+    #[arg(long, default_value_t = 1.0)]
+    dynamic_scoring_alpha: f64,
+
+    /// Beta weight for latency component in dynamic_scoring policy (reserved for future use)
+    #[arg(long, default_value_t = 0.0)]
+    dynamic_scoring_beta: f64,
+
+    /// Gamma weight for error penalty in dynamic_scoring policy (reserved for future use)
+    #[arg(long, default_value_t = 0.0)]
+    dynamic_scoring_gamma: f64,
 }
 
 impl CliArgs {
@@ -389,6 +410,21 @@ impl CliArgs {
             "consistent_hash" => PolicyConfig::ConsistentHash {
                 virtual_nodes: 160, // Default value
             },
+            "dynamic_scoring" => {
+                // Build per-worker safe capacities by zipping decode URLs with capacities
+                let mut worker_safe_capacities = HashMap::new();
+                for (url, cap) in self.decode.iter().zip(self.decode_safe_capacities.iter()) {
+                    worker_safe_capacities.insert(url.clone(), *cap);
+                }
+                PolicyConfig::DynamicScoring {
+                    default_safe_capacity: self.dynamic_scoring_default_safe_capacity,
+                    alpha: self.dynamic_scoring_alpha,
+                    beta: self.dynamic_scoring_beta,
+                    gamma: self.dynamic_scoring_gamma,
+                    load_check_interval_secs: 5,
+                    worker_safe_capacities,
+                }
+            }
             _ => PolicyConfig::RoundRobin, // Fallback
         }
     }

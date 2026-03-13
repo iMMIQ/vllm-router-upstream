@@ -144,9 +144,11 @@ impl Router {
         let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
         let worker_loads = Arc::new(rx);
 
-        // Check if default policy is power_of_two for load monitoring
+        // Check if default policy needs load monitoring
         let default_policy = ctx.policy_registry.get_default_policy();
-        let load_monitor_handle = if default_policy.name() == "power_of_two" {
+        let needs_load_monitoring =
+            |name: &str| -> bool { matches!(name, "power_of_two" | "dynamic_scoring") };
+        let load_monitor_handle = if needs_load_monitoring(default_policy.name()) {
             let monitor_urls = worker_urls.clone();
             let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
             let policy_clone = default_policy.clone();
@@ -1191,16 +1193,11 @@ impl Router {
             worker_url
         };
 
-        match self
-            .client
-            .get(format!("{}/get_load", worker_url))
-            .send()
-            .await
-        {
+        match self.client.get(format!("{}/load", worker_url)).send().await {
             Ok(res) if res.status().is_success() => match res.bytes().await {
                 Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
                     Ok(data) => data
-                        .get("load")
+                        .get("server_load")
                         .and_then(|v| v.as_i64())
                         .map(|v| v as isize),
                     Err(e) => {
@@ -1276,11 +1273,11 @@ impl Router {
             worker_url
         };
 
-        match client.get(format!("{}/get_load", worker_url)).send().await {
+        match client.get(format!("{}/load", worker_url)).send().await {
             Ok(res) if res.status().is_success() => match res.bytes().await {
                 Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
                     Ok(data) => data
-                        .get("load")
+                        .get("server_load")
                         .and_then(|v| v.as_i64())
                         .map(|v| v as isize),
                     Err(e) => {
