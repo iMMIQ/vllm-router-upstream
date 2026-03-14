@@ -7,6 +7,7 @@
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
+use rand::Rng;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::info;
@@ -135,22 +136,35 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
             return Some(idx);
         }
 
-        // Find worker with minimum score
-        let mut best_idx = healthy_indices[0];
-        let mut best_score = self.compute_score(workers[best_idx].as_ref());
+        // Compute scores for all healthy workers
+        let scores: Vec<(usize, f64)> = healthy_indices
+            .iter()
+            .map(|&idx| (idx, self.compute_score(workers[idx].as_ref())))
+            .collect();
 
-        for &idx in &healthy_indices[1..] {
-            let score = self.compute_score(workers[idx].as_ref());
-            if score < best_score {
-                best_score = score;
-                best_idx = idx;
-            }
-        }
+        let best_score = scores.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
+
+        // Collect all workers tied at the best score (within epsilon)
+        const EPSILON: f64 = 1e-9;
+        let tied: Vec<usize> = scores
+            .iter()
+            .filter(|(_, s)| (*s - best_score).abs() < EPSILON)
+            .map(|(idx, _)| *idx)
+            .collect();
+
+        // Random tie-breaking among tied workers
+        let best_idx = if tied.len() == 1 {
+            tied[0]
+        } else {
+            let mut rng = rand::rng();
+            tied[rng.random_range(0..tied.len())]
+        };
 
         info!(
-            "Dynamic scoring selection: {} (score={:.3}) from {} healthy workers",
+            "Dynamic scoring selection: {} (score={:.3}, tied={}) from {} healthy workers",
             workers[best_idx].url(),
             best_score,
+            tied.len(),
             healthy_indices.len()
         );
 
@@ -318,6 +332,54 @@ mod tests {
             policy.get_safe_capacity("http://unknown:8000"),
             100.0 // default
         );
+    }
+
+    #[test]
+    fn test_dynamic_scoring_random_tiebreak_at_zero_load() {
+        let mut caps = HashMap::new();
+        caps.insert("http://w1:8000".to_string(), 60.0);
+        caps.insert("http://w2:8000".to_string(), 500.0);
+        caps.insert("http://w3:8000".to_string(), 500.0);
+
+        let config = DynamicScoringConfig {
+            worker_safe_capacities: caps,
+            ..Default::default()
+        };
+        let policy = DynamicScoringPolicy::with_config(config);
+
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w3:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+
+        // All loads are 0 → all scores are 0 → should randomly distribute
+        let mut loads = HashMap::new();
+        loads.insert("http://w1:8000".to_string(), 0);
+        loads.insert("http://w2:8000".to_string(), 0);
+        loads.insert("http://w3:8000".to_string(), 0);
+        policy.update_loads(&loads);
+
+        let mut counts = [0usize; 3];
+        for _ in 0..300 {
+            if let Some(idx) = policy.select_worker(&workers, None) {
+                counts[idx] += 1;
+            }
+        }
+
+        // All three workers should be selected (not just the first one)
+        assert!(counts[0] > 0, "w1 should be selected at least once");
+        assert!(counts[1] > 0, "w2 should be selected at least once");
+        assert!(counts[2] > 0, "w3 should be selected at least once");
     }
 
     #[test]
