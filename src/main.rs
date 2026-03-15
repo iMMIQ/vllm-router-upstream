@@ -344,8 +344,9 @@ struct CliArgs {
     #[arg(long, default_value_t = false)]
     profile: bool,
 
-    /// Comma-separated safe capacities for decode workers (positional mapping to --decode args).
-    /// Used with --decode-policy dynamic_scoring.
+    /// Comma-separated safe capacities for decode nodes (positional mapping to --decode args).
+    /// These are node-level total capacities; automatically divided by --intra-node-data-parallel-size
+    /// to get per-rank capacity. Used with --decode-policy dynamic_scoring.
     #[arg(long, value_delimiter = ',')]
     decode_safe_capacities: Vec<f64>,
 
@@ -411,13 +412,18 @@ impl CliArgs {
                 virtual_nodes: 160, // Default value
             },
             "dynamic_scoring" => {
-                // Build per-worker safe capacities by zipping decode URLs with capacities
+                // Build per-worker safe capacities by zipping decode URLs with capacities.
+                // The user specifies node-level total capacity; divide by DP size to get per-rank capacity.
+                let dp_size = self.intra_node_data_parallel_size.max(1) as f64;
                 let mut worker_safe_capacities = HashMap::new();
                 for (url, cap) in self.decode.iter().zip(self.decode_safe_capacities.iter()) {
-                    worker_safe_capacities.insert(url.clone(), *cap);
+                    let per_rank_cap = cap / dp_size;
+                    println!("Dynamic scoring: {} node_capacity={} per_rank_capacity={} (dp_size={})",
+                          url, cap, per_rank_cap, dp_size as usize);
+                    worker_safe_capacities.insert(url.clone(), per_rank_cap);
                 }
                 PolicyConfig::DynamicScoring {
-                    default_safe_capacity: self.dynamic_scoring_default_safe_capacity,
+                    default_safe_capacity: self.dynamic_scoring_default_safe_capacity / dp_size,
                     alpha: self.dynamic_scoring_alpha,
                     beta: self.dynamic_scoring_beta,
                     gamma: self.dynamic_scoring_gamma,
