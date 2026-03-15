@@ -201,9 +201,9 @@ impl DynamicScoringPolicy {
         // This avoids a binary cliff that causes oscillation when a worker
         // hovers around the threshold.
         if let Some(&usage) = gpu_cache_usage.get(worker.url()) {
-            if usage > self.gpu_cache_overload_threshold {
-                let headroom = 1.0 - self.gpu_cache_overload_threshold; // e.g., 0.1
-                let excess = (usage - self.gpu_cache_overload_threshold) / headroom; // 0.0~1.0
+            let threshold = self.gpu_cache_overload_threshold;
+            if threshold < 1.0 && usage > threshold {
+                let excess = (usage - threshold) / (1.0 - threshold); // 0.0~1.0
                 score += excess * 10.0;
             }
         }

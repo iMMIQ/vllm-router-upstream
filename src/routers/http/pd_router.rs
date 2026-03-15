@@ -29,6 +29,7 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -1822,6 +1823,9 @@ fn parse_prometheus_metric(text: &str, metric_name: &str) -> Option<f64> {
     if found { Some(total) } else { None }
 }
 
+/// Whether we've already warned about missing vLLM metrics (warn once, then suppress).
+static METRICS_WARN_EMITTED: AtomicBool = AtomicBool::new(false);
+
 /// Fetch worker metrics from the /metrics (Prometheus) endpoint.
 async fn get_worker_metrics(client: &Client, worker_url: &str) -> Option<WorkerMetrics> {
     let (base_url, dp_rank) = super::dp_utils::parse_worker_url(worker_url);
@@ -1836,12 +1840,15 @@ async fn get_worker_metrics(client: &Client, worker_url: &str) -> Option<WorkerM
                     parse_prometheus_metric(&text, "vllm:gpu_cache_usage_perc");
 
                 if running_opt.is_none() && waiting_opt.is_none() && gpu_cache_opt.is_none() {
-                    warn!(
-                        "No vLLM metrics found from {}. Check metric names \
-                         (expected vllm:num_requests_running, vllm:num_requests_waiting, \
-                         vllm:gpu_cache_usage_perc)",
-                        worker_url
-                    );
+                    // Warn once, then suppress to avoid log flooding every poll interval
+                    if !METRICS_WARN_EMITTED.swap(true, AtomicOrdering::Relaxed) {
+                        warn!(
+                            "No vLLM metrics found from {}. Check metric names \
+                             (expected vllm:num_requests_running, vllm:num_requests_waiting, \
+                             vllm:gpu_cache_usage_perc). This warning will not repeat.",
+                            worker_url
+                        );
+                    }
                 }
 
                 Some(WorkerMetrics {
