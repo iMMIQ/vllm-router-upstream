@@ -121,11 +121,16 @@ impl DynamicScoringPolicy {
         0.0
     }
 
-    /// Increment the pending selection count for a worker
-    fn increment_pending(&self, worker_url: &str) {
+    /// Increment the pending selection count for a worker, capped at `max_pending`.
+    /// The cap prevents runaway accumulation over a poll interval. Once all workers
+    /// reach the cap, scores equalize and capacity-weighted tiebreaking controls the ratio.
+    fn increment_pending(&self, worker_url: &str, max_pending: usize) {
         if let Ok(counts) = self.pending_counts.read() {
             if let Some(count) = counts.get(worker_url) {
-                count.fetch_add(1, Ordering::Relaxed);
+                let current = count.load(Ordering::Relaxed);
+                if current < max_pending {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
                 return;
             }
         }
@@ -269,7 +274,8 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
 
         // Increment pending count so the next concurrent request sees a higher score
         // for this worker, preventing thundering herd during the prefill→decode gap.
-        self.increment_pending(workers[best_idx].url());
+        // Cap at total healthy workers to prevent runaway accumulation.
+        self.increment_pending(workers[best_idx].url(), healthy_indices.len());
 
         workers[best_idx].increment_processed();
         RouterMetrics::record_processed_request(workers[best_idx].url());
@@ -626,11 +632,13 @@ mod tests {
             }
         }
 
-        // Each worker should get roughly 25 selections (not all to one worker)
+        // Each worker should get some selections (not all to one worker).
+        // With capped pending, distribution relies on capacity-weighted tiebreaking
+        // after the first round, so variance is higher but no worker should be starved.
         for (i, &count) in counts.iter().enumerate() {
             assert!(
-                count >= 15 && count <= 35,
-                "worker {} got {} selections, expected ~25 (pending counts should distribute)",
+                count >= 10,
+                "worker {} got only {} selections, should not be starved",
                 i, count
             );
         }
