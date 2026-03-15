@@ -105,14 +105,20 @@ impl DynamicScoringPolicy {
         self.default_safe_capacity
     }
 
-    /// Get the current load for a worker (cached or local fallback)
+    /// Get the current effective load for a worker.
+    ///
+    /// Combines the cached external load (from periodic polling) with the local
+    /// in-flight count. This prevents the "thundering herd" problem where all
+    /// requests go to the same worker between load polls, because the local
+    /// in-flight count increases with each dispatched request.
     fn get_worker_load(&self, worker: &dyn Worker) -> f64 {
+        let local_inflight = worker.load() as f64;
         if let Ok(loads) = self.cached_loads.read() {
-            if let Some(&load) = loads.get(worker.url()) {
-                return load as f64;
+            if let Some(&cached) = loads.get(worker.url()) {
+                return cached as f64 + local_inflight;
             }
         }
-        worker.load() as f64
+        local_inflight
     }
 
     /// Compute the score for a worker (lower is better)
@@ -436,5 +442,48 @@ mod tests {
         // Should only select w2
         let selected = policy.select_worker(&workers, None);
         assert_eq!(selected, Some(1));
+    }
+
+    #[test]
+    fn test_dynamic_scoring_combines_cached_and_local_load() {
+        // Regression test: without combining cached + local inflight,
+        // a worker with the lowest cached load gets ALL requests between polls.
+        let mut caps = HashMap::new();
+        caps.insert("http://w1:8000".to_string(), 100.0);
+        caps.insert("http://w2:8000".to_string(), 100.0);
+
+        let config = DynamicScoringConfig {
+            worker_safe_capacities: caps,
+            ..Default::default()
+        };
+        let policy = DynamicScoringPolicy::with_config(config);
+
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+
+        // Cached loads: w1=50, w2=48 (w2 slightly lower)
+        let mut loads = HashMap::new();
+        loads.insert("http://w1:8000".to_string(), 50);
+        loads.insert("http://w2:8000".to_string(), 48);
+        policy.update_loads(&loads);
+
+        // Simulate w2 receiving 5 in-flight requests (local load)
+        for _ in 0..5 {
+            workers[1].increment_load();
+        }
+
+        // w1 effective = 50 + 0 = 50, score = 50/100 = 0.5
+        // w2 effective = 48 + 5 = 53, score = 53/100 = 0.53
+        // Should select w1 because its effective load is lower
+        let selected = policy.select_worker(&workers, None);
+        assert_eq!(selected, Some(0), "w1 should be selected: lower effective load (cached + inflight)");
     }
 }

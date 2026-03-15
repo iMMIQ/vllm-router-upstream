@@ -26,15 +26,15 @@ impl PowerOfTwoPolicy {
     }
 
     fn get_worker_load(&self, worker: &dyn Worker) -> isize {
-        // First check cached loads (from external monitoring)
+        let local_inflight = worker.load() as isize;
+        // Combine cached external load with local in-flight count to avoid
+        // thundering herd between load polls
         if let Ok(loads) = self.cached_loads.read() {
-            if let Some(&load) = loads.get(worker.url()) {
-                return load;
+            if let Some(&cached) = loads.get(worker.url()) {
+                return cached + local_inflight;
             }
         }
-
-        // Fall back to local load counter
-        worker.load() as isize
+        local_inflight
     }
 }
 
