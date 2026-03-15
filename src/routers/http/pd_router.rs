@@ -1370,7 +1370,7 @@ impl PDRouter {
         Ok(available_workers[selected_idx].clone())
     }
 
-    // Background task to monitor worker loads with shared client
+    // Background task to monitor worker loads via /metrics endpoint
     async fn monitor_worker_loads_with_client(
         worker_urls: Vec<String>,
         tx: tokio::sync::watch::Sender<HashMap<String, isize>>,
@@ -1381,6 +1381,7 @@ impl PDRouter {
     ) {
         loop {
             let mut loads = HashMap::new();
+            let mut gpu_cache_usage = HashMap::new();
 
             let futures: Vec<_> = worker_urls
                 .iter()
@@ -1388,23 +1389,34 @@ impl PDRouter {
                     let client = client.clone();
                     let url = url.clone();
                     async move {
-                        let load = get_worker_load(&client, &url).await.unwrap_or(0);
-                        (url, load)
+                        let metrics = get_worker_metrics(&client, &url).await;
+                        (url, metrics)
                     }
                 })
                 .collect();
 
             let results = futures_util::future::join_all(futures).await;
 
-            for (url, load) in results {
-                loads.insert(url, load);
+            for (url, metrics) in results {
+                if let Some(m) = metrics {
+                    debug!(
+                        "Worker {} metrics: running={}, waiting={}, gpu_cache={:.3}",
+                        url, m.num_requests_running, m.num_requests_waiting, m.gpu_cache_usage_perc
+                    );
+                    loads.insert(url.clone(), m.total_load());
+                    gpu_cache_usage.insert(url, m.gpu_cache_usage_perc);
+                } else {
+                    loads.insert(url, 0);
+                }
             }
 
             debug!("Worker loads updated: {:?}", loads);
 
-            // Update both policies with current loads
+            // Update both policies with current loads and GPU cache usage
             prefill_policy.update_loads(&loads);
             decode_policy.update_loads(&loads);
+            prefill_policy.update_gpu_cache_usage(&gpu_cache_usage);
+            decode_policy.update_gpu_cache_usage(&gpu_cache_usage);
 
             // Check if receiver is still active
             if tx.send(loads).is_err() {
@@ -1759,40 +1771,90 @@ impl PDRouter {
 
 // Helper functions
 
-async fn get_worker_load(client: &Client, worker_url: &str) -> Option<isize> {
+/// Metrics fetched from a vLLM worker's /metrics endpoint
+#[derive(Debug, Default)]
+struct WorkerMetrics {
+    num_requests_running: isize,
+    num_requests_waiting: isize,
+    gpu_cache_usage_perc: f64,
+}
+
+impl WorkerMetrics {
+    /// Total load = running + waiting (same units as safe_capacity)
+    fn total_load(&self) -> isize {
+        self.num_requests_running + self.num_requests_waiting
+    }
+}
+
+/// Parse a single Prometheus metric value from text.
+/// Handles both `metric_name{labels} value` and `metric_name value` formats.
+fn parse_prometheus_metric(text: &str, metric_name: &str) -> Option<f64> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if line.starts_with(metric_name) {
+            let rest = &line[metric_name.len()..];
+            // Next char must be '{' (labels) or ' ' (value) to avoid partial name matches
+            if rest.starts_with('{') || rest.starts_with(' ') {
+                // Value is the last whitespace-separated token on the line
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if let Some(value_str) = parts.last() {
+                    return value_str.parse::<f64>().ok();
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Fetch worker metrics from the /metrics (Prometheus) endpoint.
+async fn get_worker_metrics(client: &Client, worker_url: &str) -> Option<WorkerMetrics> {
     let (base_url, dp_rank) = super::dp_utils::parse_worker_url(worker_url);
-    let request = client.get(format!("{}/load", base_url));
+    let request = client.get(format!("{}/metrics", base_url));
     let request = super::dp_utils::add_dp_rank_header(request, dp_rank);
     match request.send().await {
-        Ok(res) if res.status().is_success() => match res.bytes().await {
-            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-                Ok(data) => data
-                    .get("server_load")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as isize),
-                Err(e) => {
-                    debug!("Failed to parse load response from {}: {}", worker_url, e);
-                    None
-                }
-            },
+        Ok(res) if res.status().is_success() => match res.text().await {
+            Ok(text) => {
+                let running = parse_prometheus_metric(&text, "vllm:num_requests_running")
+                    .unwrap_or(0.0) as isize;
+                let waiting = parse_prometheus_metric(&text, "vllm:num_requests_waiting")
+                    .unwrap_or(0.0) as isize;
+                let gpu_cache =
+                    parse_prometheus_metric(&text, "vllm:gpu_cache_usage_perc").unwrap_or(0.0);
+                Some(WorkerMetrics {
+                    num_requests_running: running,
+                    num_requests_waiting: waiting,
+                    gpu_cache_usage_perc: gpu_cache,
+                })
+            }
             Err(e) => {
-                debug!("Failed to read load response from {}: {}", worker_url, e);
+                debug!("Failed to read metrics from {}: {}", worker_url, e);
                 None
             }
         },
         Ok(res) => {
             debug!(
-                "Worker {} returned non-success status: {}",
+                "Worker {} /metrics returned non-success status: {}",
                 worker_url,
                 res.status()
             );
             None
         }
         Err(e) => {
-            debug!("Failed to get load from {}: {}", worker_url, e);
+            debug!("Failed to get metrics from {}: {}", worker_url, e);
             None
         }
     }
+}
+
+/// Backward-compatible wrapper: returns total_load (running + waiting) as isize.
+/// Used by the /worker_loads HTTP endpoint.
+async fn get_worker_load(client: &Client, worker_url: &str) -> Option<isize> {
+    get_worker_metrics(client, worker_url)
+        .await
+        .map(|m| m.total_load())
 }
 
 #[async_trait]

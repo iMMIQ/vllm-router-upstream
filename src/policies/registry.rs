@@ -217,6 +217,7 @@ impl PolicyRegistry {
                     beta: *beta,
                     gamma: *gamma,
                     worker_safe_capacities: worker_safe_capacities.clone(),
+                    ..Default::default()
                 };
                 Arc::new(DynamicScoringPolicy::with_config(config))
             }

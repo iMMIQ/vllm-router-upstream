@@ -115,6 +115,14 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that don't use load information
     }
 
+    /// Update GPU cache usage information
+    ///
+    /// Called periodically with per-worker GPU KV-cache usage (0.0 to 1.0).
+    /// Policies can use this as an overload signal.
+    fn update_gpu_cache_usage(&self, _usage: &std::collections::HashMap<String, f64>) {
+        // Default: no-op
+    }
+
     /// Reset any internal state
     ///
     /// This is useful for policies that maintain state (e.g., round-robin counters).

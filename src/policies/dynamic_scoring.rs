@@ -26,6 +26,8 @@ pub struct DynamicScoringConfig {
     pub gamma: f64,
     /// Per-worker safe capacity overrides (URL -> capacity)
     pub worker_safe_capacities: HashMap<String, f64>,
+    /// GPU cache usage threshold (0.0~1.0) above which a worker is penalized as overloaded
+    pub gpu_cache_overload_threshold: f64,
 }
 
 impl Default for DynamicScoringConfig {
@@ -36,6 +38,7 @@ impl Default for DynamicScoringConfig {
             beta: 0.0,
             gamma: 0.0,
             worker_safe_capacities: HashMap::new(),
+            gpu_cache_overload_threshold: 0.9,
         }
     }
 }
@@ -55,8 +58,12 @@ pub struct DynamicScoringPolicy {
     safe_capacities: RwLock<HashMap<String, f64>>,
     /// Default safe capacity for unconfigured workers
     default_safe_capacity: f64,
-    /// Cached load information from external monitoring
+    /// Cached load information from external monitoring (running + waiting)
     cached_loads: RwLock<HashMap<String, isize>>,
+    /// Cached GPU KV-cache usage per worker (0.0~1.0)
+    cached_gpu_cache_usage: RwLock<HashMap<String, f64>>,
+    /// GPU cache usage threshold above which a worker is penalized
+    gpu_cache_overload_threshold: f64,
     /// Pending selection counts since the last load poll.
     /// Each selection increments the worker's count; reset on update_loads.
     /// This prevents thundering herd during the prefill→decode gap.
@@ -79,6 +86,8 @@ impl DynamicScoringPolicy {
             safe_capacities: RwLock::new(config.worker_safe_capacities),
             default_safe_capacity: config.default_safe_capacity,
             cached_loads: RwLock::new(HashMap::new()),
+            cached_gpu_cache_usage: RwLock::new(HashMap::new()),
+            gpu_cache_overload_threshold: config.gpu_cache_overload_threshold,
             pending_counts: RwLock::new(HashMap::new()),
             alpha: config.alpha,
             beta: config.beta,
@@ -147,41 +156,25 @@ impl DynamicScoringPolicy {
         }
     }
 
-    /// Average loads across DP ranks of the same node.
-    /// For DP-aware URLs like "http://host:8000@0", "http://host:8000@1", etc.,
-    /// compute the average load and assign it to all ranks. Non-DP URLs pass through unchanged.
-    fn average_loads_by_node(loads: &HashMap<String, isize>) -> HashMap<String, isize> {
-        // Group by base URL
-        let mut node_loads: HashMap<String, Vec<(String, isize)>> = HashMap::new();
-        for (url, &load) in loads {
-            let base = if let Some(at_pos) = url.rfind('@') {
-                url[..at_pos].to_string()
-            } else {
-                url.clone()
-            };
-            node_loads.entry(base).or_default().push((url.clone(), load));
-        }
-
-        let mut result = HashMap::new();
-        for (_base, rank_loads) in &node_loads {
-            if rank_loads.len() <= 1 {
-                // Single rank or non-DP URL, no averaging needed
-                for (url, load) in rank_loads {
-                    result.insert(url.clone(), *load);
-                }
-            } else {
-                let sum: isize = rank_loads.iter().map(|(_, l)| *l).sum();
-                let avg = sum / rank_loads.len() as isize;
-                for (url, _) in rank_loads {
-                    result.insert(url.clone(), avg);
-                }
-            }
-        }
-        result
+    /// Resolve safe capacity for a worker URL from a pre-snapshotted map.
+    /// Tries exact match, then DP-aware base URL fallback, then default.
+    fn resolve_safe_capacity(&self, worker_url: &str, safe_caps: &HashMap<String, f64>) -> f64 {
+        safe_caps
+            .get(worker_url)
+            .copied()
+            .or_else(|| {
+                worker_url
+                    .rfind('@')
+                    .and_then(|pos| safe_caps.get(&worker_url[..pos]).copied())
+            })
+            .unwrap_or(self.default_safe_capacity)
     }
 
     /// Compute the score for a worker (lower is better).
-    /// Score = α * (load / safe_cap) + pending / num_workers.
+    ///
+    /// Score = α * (load / safe_cap) + pending / num_workers
+    ///       + overload_penalty (if gpu_cache_usage > threshold)
+    ///
     /// Pending is added AFTER normalization so its impact is equal across workers
     /// with different capacities, preventing capacity bias in the tiebreaker.
     ///
@@ -193,33 +186,35 @@ impl DynamicScoringPolicy {
         cached_loads: &HashMap<String, isize>,
         safe_caps: &HashMap<String, f64>,
         pending_counts: &HashMap<String, usize>,
+        gpu_cache_usage: &HashMap<String, f64>,
     ) -> f64 {
         let local_inflight = worker.load() as f64;
         let cached = cached_loads.get(worker.url()).copied().unwrap_or(0) as f64;
-        let safe_cap = safe_caps
-            .get(worker.url())
-            .copied()
-            .or_else(|| {
-                worker
-                    .url()
-                    .rfind('@')
-                    .and_then(|pos| safe_caps.get(&worker.url()[..pos]).copied())
-            })
-            .unwrap_or(self.default_safe_capacity);
+        let safe_cap = self.resolve_safe_capacity(worker.url(), safe_caps);
         let pending = *pending_counts.get(worker.url()).unwrap_or(&0) as f64;
         let num = if num_workers > 0 { num_workers as f64 } else { 1.0 };
 
-        self.alpha * ((cached + local_inflight) / safe_cap) + pending / num
+        let mut score = self.alpha * ((cached + local_inflight) / safe_cap) + pending / num;
+
+        // GPU cache overload penalty: if KV-cache usage exceeds threshold,
+        // add a large penalty to steer traffic away from this worker.
+        if let Some(&usage) = gpu_cache_usage.get(worker.url()) {
+            if usage > self.gpu_cache_overload_threshold {
+                score += 1000.0;
+            }
+        }
+
+        score
     }
 
     /// Snapshot all lock-protected state once for use in the scoring loop.
-    /// Returns (cached_loads, safe_capacities, pending_counts).
     fn snapshot_state(
         &self,
     ) -> (
         HashMap<String, isize>,
         HashMap<String, f64>,
         HashMap<String, usize>,
+        HashMap<String, f64>,
     ) {
         let cached = self
             .cached_loads
@@ -240,7 +235,12 @@ impl DynamicScoringPolicy {
                     .collect()
             })
             .unwrap_or_default();
-        (cached, caps, pending)
+        let gpu_cache = self
+            .cached_gpu_cache_usage
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        (cached, caps, pending, gpu_cache)
     }
 }
 
@@ -265,9 +265,8 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
             return Some(idx);
         }
 
-        // Snapshot all lock-protected state once (3 locks) instead of
-        // acquiring per-worker (3 × N locks for N healthy workers).
-        let (cached_loads, safe_caps, pending_snap) = self.snapshot_state();
+        // Snapshot all lock-protected state once instead of per-worker locking.
+        let (cached_loads, safe_caps, pending_snap, gpu_cache) = self.snapshot_state();
 
         // Compute scores for all healthy workers
         let num_workers = healthy_indices.len();
@@ -280,6 +279,7 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
                     &cached_loads,
                     &safe_caps,
                     &pending_snap,
+                    &gpu_cache,
                 );
                 (idx, score)
             })
@@ -305,18 +305,7 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
         } else {
             let weights: Vec<f64> = tied
                 .iter()
-                .map(|&idx| {
-                    safe_caps
-                        .get(workers[idx].url())
-                        .copied()
-                        .or_else(|| {
-                            workers[idx]
-                                .url()
-                                .rfind('@')
-                                .and_then(|pos| safe_caps.get(&workers[idx].url()[..pos]).copied())
-                        })
-                        .unwrap_or(self.default_safe_capacity)
-                })
+                .map(|&idx| self.resolve_safe_capacity(workers[idx].url(), &safe_caps))
                 .collect();
             let total_weight: f64 = weights.iter().sum();
             let mut rng = rand::rng();
@@ -358,12 +347,10 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
     }
 
     fn update_loads(&self, loads: &HashMap<String, isize>) {
-        // Average cached loads across ranks of the same node (base URL).
-        // This prevents intra-node rank imbalance caused by vLLM reporting
-        // slightly different loads per rank, which creates a positive feedback loop.
-        let averaged = Self::average_loads_by_node(loads);
+        // Store per-rank loads directly from /metrics (running + waiting).
+        // No averaging — accurate per-rank data from Prometheus metrics.
         if let Ok(mut cached) = self.cached_loads.write() {
-            *cached = averaged;
+            *cached = loads.clone();
         }
         // Reset pending counts: the fresh cached loads already reflect
         // requests that were dispatched since the last poll.
@@ -371,6 +358,12 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
             for counter in counts.values() {
                 counter.store(0, Ordering::Relaxed);
             }
+        }
+    }
+
+    fn update_gpu_cache_usage(&self, usage: &HashMap<String, f64>) {
+        if let Ok(mut cached) = self.cached_gpu_cache_usage.write() {
+            *cached = usage.clone();
         }
     }
 
@@ -402,6 +395,7 @@ mod tests {
             beta: 0.0,
             gamma: 0.0,
             worker_safe_capacities: caps,
+            ..Default::default()
         };
         let policy = DynamicScoringPolicy::with_config(config);
 
