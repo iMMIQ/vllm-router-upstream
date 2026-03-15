@@ -9,6 +9,7 @@ use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use rand::Rng;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::info;
 
@@ -54,6 +55,10 @@ pub struct DynamicScoringPolicy {
     default_safe_capacity: f64,
     /// Cached load information from external monitoring
     cached_loads: RwLock<HashMap<String, isize>>,
+    /// Pending selection counts since the last load poll.
+    /// Each selection increments the worker's count; reset on update_loads.
+    /// This prevents thundering herd during the prefill→decode gap.
+    pending_counts: RwLock<HashMap<String, AtomicUsize>>,
     /// Scoring weights
     alpha: f64,
     #[allow(dead_code)]
@@ -72,6 +77,7 @@ impl DynamicScoringPolicy {
             safe_capacities: RwLock::new(config.worker_safe_capacities),
             default_safe_capacity: config.default_safe_capacity,
             cached_loads: RwLock::new(HashMap::new()),
+            pending_counts: RwLock::new(HashMap::new()),
             alpha: config.alpha,
             beta: config.beta,
             gamma: config.gamma,
@@ -105,20 +111,47 @@ impl DynamicScoringPolicy {
         self.default_safe_capacity
     }
 
-    /// Get the current effective load for a worker.
-    ///
-    /// Combines the cached external load (from periodic polling) with the local
-    /// in-flight count. This prevents the "thundering herd" problem where all
-    /// requests go to the same worker between load polls, because the local
-    /// in-flight count increases with each dispatched request.
-    fn get_worker_load(&self, worker: &dyn Worker) -> f64 {
-        let local_inflight = worker.load() as f64;
-        if let Ok(loads) = self.cached_loads.read() {
-            if let Some(&cached) = loads.get(worker.url()) {
-                return cached as f64 + local_inflight;
+    /// Get the pending selection count for a worker (selections since last load poll)
+    fn get_pending_count(&self, worker_url: &str) -> f64 {
+        if let Ok(counts) = self.pending_counts.read() {
+            if let Some(count) = counts.get(worker_url) {
+                return count.load(Ordering::Relaxed) as f64;
             }
         }
-        local_inflight
+        0.0
+    }
+
+    /// Increment the pending selection count for a worker
+    fn increment_pending(&self, worker_url: &str) {
+        if let Ok(counts) = self.pending_counts.read() {
+            if let Some(count) = counts.get(worker_url) {
+                count.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        // Key doesn't exist yet, need write lock
+        if let Ok(mut counts) = self.pending_counts.write() {
+            counts
+                .entry(worker_url.to_string())
+                .or_insert_with(|| AtomicUsize::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Get the current effective load for a worker.
+    ///
+    /// Combines cached external load + local in-flight count + pending selections.
+    /// The pending count captures requests dispatched since the last load poll that
+    /// haven't yet entered the decode phase (still in prefill), preventing thundering herd.
+    fn get_worker_load(&self, worker: &dyn Worker) -> f64 {
+        let local_inflight = worker.load() as f64;
+        let pending = self.get_pending_count(worker.url());
+        if let Ok(loads) = self.cached_loads.read() {
+            if let Some(&cached) = loads.get(worker.url()) {
+                return cached as f64 + local_inflight + pending;
+            }
+        }
+        local_inflight + pending
     }
 
     /// Compute the score for a worker (lower is better)
@@ -182,6 +215,10 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
             healthy_indices.len()
         );
 
+        // Increment pending count so the next concurrent request sees a higher score
+        // for this worker, preventing thundering herd during the prefill→decode gap.
+        self.increment_pending(workers[best_idx].url());
+
         workers[best_idx].increment_processed();
         RouterMetrics::record_processed_request(workers[best_idx].url());
         RouterMetrics::record_policy_decision(self.name(), workers[best_idx].url());
@@ -196,6 +233,13 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
     fn update_loads(&self, loads: &HashMap<String, isize>) {
         if let Ok(mut cached) = self.cached_loads.write() {
             *cached = loads.clone();
+        }
+        // Reset pending counts: the fresh cached loads already reflect
+        // requests that were dispatched since the last poll.
+        if let Ok(mut counts) = self.pending_counts.write() {
+            for counter in counts.values() {
+                counter.store(0, Ordering::Relaxed);
+            }
         }
     }
 
@@ -485,5 +529,80 @@ mod tests {
         // Should select w1 because its effective load is lower
         let selected = policy.select_worker(&workers, None);
         assert_eq!(selected, Some(0), "w1 should be selected: lower effective load (cached + inflight)");
+    }
+
+    #[test]
+    fn test_pending_counts_prevent_thundering_herd() {
+        // With equal cached loads, consecutive selections should round-robin
+        // via pending counts instead of always picking the same worker.
+        let mut caps = HashMap::new();
+        caps.insert("http://w1:8000".to_string(), 100.0);
+        caps.insert("http://w2:8000".to_string(), 100.0);
+        caps.insert("http://w3:8000".to_string(), 100.0);
+        caps.insert("http://w4:8000".to_string(), 100.0);
+
+        let config = DynamicScoringConfig {
+            worker_safe_capacities: caps,
+            ..Default::default()
+        };
+        let policy = DynamicScoringPolicy::with_config(config);
+
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular)),
+            Arc::new(BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular)),
+            Arc::new(BasicWorker::new("http://w3:8000".to_string(), WorkerType::Regular)),
+            Arc::new(BasicWorker::new("http://w4:8000".to_string(), WorkerType::Regular)),
+        ];
+
+        // All workers have the same cached load
+        let mut loads = HashMap::new();
+        loads.insert("http://w1:8000".to_string(), 50);
+        loads.insert("http://w2:8000".to_string(), 50);
+        loads.insert("http://w3:8000".to_string(), 50);
+        loads.insert("http://w4:8000".to_string(), 50);
+        policy.update_loads(&loads);
+
+        // Make 100 selections - should distribute across all 4 workers
+        let mut counts = [0usize; 4];
+        for _ in 0..100 {
+            if let Some(idx) = policy.select_worker(&workers, None) {
+                counts[idx] += 1;
+            }
+        }
+
+        // Each worker should get roughly 25 selections (not all to one worker)
+        for (i, &count) in counts.iter().enumerate() {
+            assert!(
+                count >= 15 && count <= 35,
+                "worker {} got {} selections, expected ~25 (pending counts should distribute)",
+                i, count
+            );
+        }
+    }
+
+    #[test]
+    fn test_pending_counts_reset_on_load_update() {
+        let policy = DynamicScoringPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular)),
+            Arc::new(BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular)),
+        ];
+
+        let mut loads = HashMap::new();
+        loads.insert("http://w1:8000".to_string(), 50);
+        loads.insert("http://w2:8000".to_string(), 50);
+        policy.update_loads(&loads);
+
+        // Select w1 or w2 a few times to build up pending counts
+        for _ in 0..5 {
+            policy.select_worker(&workers, None);
+        }
+
+        // After update_loads, pending counts should reset
+        policy.update_loads(&loads);
+
+        // Verify pending counts are 0
+        assert_eq!(policy.get_pending_count("http://w1:8000"), 0.0);
+        assert_eq!(policy.get_pending_count("http://w2:8000"), 0.0);
     }
 }
