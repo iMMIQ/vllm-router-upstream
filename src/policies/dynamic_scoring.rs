@@ -236,7 +236,7 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
         }
         // Reset pending counts: the fresh cached loads already reflect
         // requests that were dispatched since the last poll.
-        if let Ok(mut counts) = self.pending_counts.write() {
+        if let Ok(counts) = self.pending_counts.write() {
             for counter in counts.values() {
                 counter.store(0, Ordering::Relaxed);
             }
