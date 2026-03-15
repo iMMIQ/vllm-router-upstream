@@ -11,7 +11,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use tracing::info;
+use tracing::debug;
 
 /// Configuration for the dynamic scoring policy
 #[derive(Debug, Clone)]
@@ -43,10 +43,12 @@ impl Default for DynamicScoringConfig {
 /// Dynamic scoring policy
 ///
 /// Computes a score for each healthy worker:
-///   score = α * (inflight / safe_capacity)
+///   score = α * ((cached_load + inflight) / safe_capacity) + pending / num_workers
 ///
 /// The worker with the lowest score is selected. This naturally balances load
 /// across heterogeneous workers with different safe operating capacities.
+/// Pending counts are added post-normalization so that the penalty is equal
+/// regardless of each worker's capacity.
 #[derive(Debug)]
 pub struct DynamicScoringPolicy {
     /// Per-worker safe capacity (URL -> safe working point)
@@ -94,6 +96,7 @@ impl DynamicScoringPolicy {
     }
 
     /// Get the safe capacity for a worker URL
+    #[cfg(test)]
     fn get_safe_capacity(&self, worker_url: &str) -> f64 {
         if let Ok(caps) = self.safe_capacities.read() {
             // Try exact match first
@@ -112,6 +115,7 @@ impl DynamicScoringPolicy {
     }
 
     /// Get the pending selection count for a worker (selections since last load poll)
+    #[cfg(test)]
     fn get_pending_count(&self, worker_url: &str) -> f64 {
         if let Ok(counts) = self.pending_counts.read() {
             if let Some(count) = counts.get(worker_url) {
@@ -180,18 +184,63 @@ impl DynamicScoringPolicy {
     /// Score = α * (load / safe_cap) + pending / num_workers.
     /// Pending is added AFTER normalization so its impact is equal across workers
     /// with different capacities, preventing capacity bias in the tiebreaker.
-    fn compute_score(&self, worker: &dyn Worker, num_workers: usize) -> f64 {
+    ///
+    /// Takes pre-snapshotted data to avoid per-worker lock acquisitions.
+    fn compute_score(
+        &self,
+        worker: &dyn Worker,
+        num_workers: usize,
+        cached_loads: &HashMap<String, isize>,
+        safe_caps: &HashMap<String, f64>,
+        pending_counts: &HashMap<String, usize>,
+    ) -> f64 {
         let local_inflight = worker.load() as f64;
-        let cached = if let Ok(loads) = self.cached_loads.read() {
-            loads.get(worker.url()).copied().unwrap_or(0) as f64
-        } else {
-            0.0
-        };
-        let safe_cap = self.get_safe_capacity(worker.url());
-        let pending = self.get_pending_count(worker.url());
+        let cached = cached_loads.get(worker.url()).copied().unwrap_or(0) as f64;
+        let safe_cap = safe_caps
+            .get(worker.url())
+            .copied()
+            .or_else(|| {
+                worker
+                    .url()
+                    .rfind('@')
+                    .and_then(|pos| safe_caps.get(&worker.url()[..pos]).copied())
+            })
+            .unwrap_or(self.default_safe_capacity);
+        let pending = *pending_counts.get(worker.url()).unwrap_or(&0) as f64;
         let num = if num_workers > 0 { num_workers as f64 } else { 1.0 };
 
         self.alpha * ((cached + local_inflight) / safe_cap) + pending / num
+    }
+
+    /// Snapshot all lock-protected state once for use in the scoring loop.
+    /// Returns (cached_loads, safe_capacities, pending_counts).
+    fn snapshot_state(
+        &self,
+    ) -> (
+        HashMap<String, isize>,
+        HashMap<String, f64>,
+        HashMap<String, usize>,
+    ) {
+        let cached = self
+            .cached_loads
+            .read()
+            .map(|l| l.clone())
+            .unwrap_or_default();
+        let caps = self
+            .safe_capacities
+            .read()
+            .map(|c| c.clone())
+            .unwrap_or_default();
+        let pending = self
+            .pending_counts
+            .read()
+            .map(|p| {
+                p.iter()
+                    .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (cached, caps, pending)
     }
 }
 
@@ -216,10 +265,24 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
             return Some(idx);
         }
 
+        // Snapshot all lock-protected state once (3 locks) instead of
+        // acquiring per-worker (3 × N locks for N healthy workers).
+        let (cached_loads, safe_caps, pending_snap) = self.snapshot_state();
+
         // Compute scores for all healthy workers
+        let num_workers = healthy_indices.len();
         let scores: Vec<(usize, f64)> = healthy_indices
             .iter()
-            .map(|&idx| (idx, self.compute_score(workers[idx].as_ref(), healthy_indices.len())))
+            .map(|&idx| {
+                let score = self.compute_score(
+                    workers[idx].as_ref(),
+                    num_workers,
+                    &cached_loads,
+                    &safe_caps,
+                    &pending_snap,
+                );
+                (idx, score)
+            })
             .collect();
 
         let best_score = scores.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
@@ -242,7 +305,18 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
         } else {
             let weights: Vec<f64> = tied
                 .iter()
-                .map(|&idx| self.get_safe_capacity(workers[idx].url()))
+                .map(|&idx| {
+                    safe_caps
+                        .get(workers[idx].url())
+                        .copied()
+                        .or_else(|| {
+                            workers[idx]
+                                .url()
+                                .rfind('@')
+                                .and_then(|pos| safe_caps.get(&workers[idx].url()[..pos]).copied())
+                        })
+                        .unwrap_or(self.default_safe_capacity)
+                })
                 .collect();
             let total_weight: f64 = weights.iter().sum();
             let mut rng = rand::rng();
@@ -259,7 +333,7 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
             selected
         };
 
-        info!(
+        debug!(
             "Dynamic scoring selection: {} (score={:.3}, tied={}) from {} healthy workers",
             workers[best_idx].url(),
             best_score,
