@@ -1786,9 +1786,18 @@ impl WorkerMetrics {
     }
 }
 
-/// Parse a single Prometheus metric value from text.
-/// Handles both `metric_name{labels} value` and `metric_name value` formats.
+/// Parse a Prometheus metric from text, summing all matching instances.
+///
+/// Handles formats:
+///   `metric_name{labels} value [timestamp]`
+///   `metric_name value [timestamp]`
+///
+/// When multiple instances exist (e.g., per-model or per-rank labels),
+/// their values are summed to produce the aggregate.
 fn parse_prometheus_metric(text: &str, metric_name: &str) -> Option<f64> {
+    let mut total = 0.0;
+    let mut found = false;
+
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('#') || line.is_empty() {
@@ -1798,15 +1807,19 @@ fn parse_prometheus_metric(text: &str, metric_name: &str) -> Option<f64> {
             let rest = &line[metric_name.len()..];
             // Next char must be '{' (labels) or ' ' (value) to avoid partial name matches
             if rest.starts_with('{') || rest.starts_with(' ') {
-                // Value is the last whitespace-separated token on the line
+                // Prometheus format: metric_name[{labels}] value [timestamp]
+                // Value is always the second whitespace-separated token (index 1).
+                // The optional timestamp is the third token — do NOT use parts.last().
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if let Some(value_str) = parts.last() {
-                    return value_str.parse::<f64>().ok();
+                if let Some(value) = parts.get(1).and_then(|v| v.parse::<f64>().ok()) {
+                    total += value;
+                    found = true;
                 }
             }
         }
     }
-    None
+
+    if found { Some(total) } else { None }
 }
 
 /// Fetch worker metrics from the /metrics (Prometheus) endpoint.
@@ -1817,16 +1830,24 @@ async fn get_worker_metrics(client: &Client, worker_url: &str) -> Option<WorkerM
     match request.send().await {
         Ok(res) if res.status().is_success() => match res.text().await {
             Ok(text) => {
-                let running = parse_prometheus_metric(&text, "vllm:num_requests_running")
-                    .unwrap_or(0.0) as isize;
-                let waiting = parse_prometheus_metric(&text, "vllm:num_requests_waiting")
-                    .unwrap_or(0.0) as isize;
-                let gpu_cache =
-                    parse_prometheus_metric(&text, "vllm:gpu_cache_usage_perc").unwrap_or(0.0);
+                let running_opt = parse_prometheus_metric(&text, "vllm:num_requests_running");
+                let waiting_opt = parse_prometheus_metric(&text, "vllm:num_requests_waiting");
+                let gpu_cache_opt =
+                    parse_prometheus_metric(&text, "vllm:gpu_cache_usage_perc");
+
+                if running_opt.is_none() && waiting_opt.is_none() && gpu_cache_opt.is_none() {
+                    warn!(
+                        "No vLLM metrics found from {}. Check metric names \
+                         (expected vllm:num_requests_running, vllm:num_requests_waiting, \
+                         vllm:gpu_cache_usage_perc)",
+                        worker_url
+                    );
+                }
+
                 Some(WorkerMetrics {
-                    num_requests_running: running,
-                    num_requests_waiting: waiting,
-                    gpu_cache_usage_perc: gpu_cache,
+                    num_requests_running: running_opt.unwrap_or(0.0) as isize,
+                    num_requests_waiting: waiting_opt.unwrap_or(0.0) as isize,
+                    gpu_cache_usage_perc: gpu_cache_opt.unwrap_or(0.0),
                 })
             }
             Err(e) => {
@@ -2883,5 +2904,53 @@ mod tests {
         // Check final state
         let workers = router.worker_registry.get_prefill_workers();
         assert_eq!(workers.len(), 5);
+    }
+
+    #[test]
+    fn test_parse_prometheus_metric_basic() {
+        let text = r#"
+# HELP vllm:num_requests_running Number of requests currently running
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="model"} 42.0
+"#;
+        assert_eq!(parse_prometheus_metric(text, "vllm:num_requests_running"), Some(42.0));
+    }
+
+    #[test]
+    fn test_parse_prometheus_metric_no_labels() {
+        let text = "vllm:gpu_cache_usage_perc 0.75\n";
+        assert_eq!(parse_prometheus_metric(text, "vllm:gpu_cache_usage_perc"), Some(0.75));
+    }
+
+    #[test]
+    fn test_parse_prometheus_metric_with_timestamp() {
+        // Prometheus allows optional timestamp after value — must not read it as the value
+        let text = "vllm:num_requests_running{model=\"m\"} 42.0 1700000000000\n";
+        assert_eq!(parse_prometheus_metric(text, "vllm:num_requests_running"), Some(42.0));
+    }
+
+    #[test]
+    fn test_parse_prometheus_metric_sums_multiple_instances() {
+        // Multiple label sets (e.g., per-rank) should be summed
+        let text = r#"
+vllm:num_requests_running{dp_rank="0"} 10.0
+vllm:num_requests_running{dp_rank="1"} 15.0
+vllm:num_requests_running{dp_rank="2"} 12.0
+vllm:num_requests_running{dp_rank="3"} 8.0
+"#;
+        assert_eq!(parse_prometheus_metric(text, "vllm:num_requests_running"), Some(45.0));
+    }
+
+    #[test]
+    fn test_parse_prometheus_metric_no_partial_name_match() {
+        // "vllm:num_requests_running_extra" should NOT match "vllm:num_requests_running"
+        let text = "vllm:num_requests_running_extra{} 99.0\nvllm:num_requests_running{} 42.0\n";
+        assert_eq!(parse_prometheus_metric(text, "vllm:num_requests_running"), Some(42.0));
+    }
+
+    #[test]
+    fn test_parse_prometheus_metric_not_found() {
+        let text = "some_other_metric 42.0\n";
+        assert_eq!(parse_prometheus_metric(text, "vllm:num_requests_running"), None);
     }
 }

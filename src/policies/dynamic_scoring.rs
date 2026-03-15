@@ -196,11 +196,15 @@ impl DynamicScoringPolicy {
 
         let mut score = self.alpha * ((cached + local_inflight) / safe_cap) + pending / num;
 
-        // GPU cache overload penalty: if KV-cache usage exceeds threshold,
-        // add a large penalty to steer traffic away from this worker.
+        // GPU cache overload penalty: ramp proportionally above threshold.
+        // At threshold (e.g., 0.9): penalty = 0. At 100%: penalty = 10.0.
+        // This avoids a binary cliff that causes oscillation when a worker
+        // hovers around the threshold.
         if let Some(&usage) = gpu_cache_usage.get(worker.url()) {
             if usage > self.gpu_cache_overload_threshold {
-                score += 1000.0;
+                let headroom = 1.0 - self.gpu_cache_overload_threshold; // e.g., 0.1
+                let excess = (usage - self.gpu_cache_overload_threshold) / headroom; // 0.0~1.0
+                score += excess * 10.0;
             }
         }
 
