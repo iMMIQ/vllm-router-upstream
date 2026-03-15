@@ -232,12 +232,31 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
             .map(|(idx, _)| *idx)
             .collect();
 
-        // Random tie-breaking among tied workers
+        // Capacity-weighted tie-breaking among tied workers.
+        // At equilibrium, all workers have equal normalized scores, so the tiebreaker
+        // determines the actual traffic ratio. Weighting by safe_capacity ensures workers
+        // with higher capacity receive proportionally more traffic (e.g., 1:2 ratio for
+        // capacities 64 vs 128) instead of equal random splitting.
         let best_idx = if tied.len() == 1 {
             tied[0]
         } else {
+            let weights: Vec<f64> = tied
+                .iter()
+                .map(|&idx| self.get_safe_capacity(workers[idx].url()))
+                .collect();
+            let total_weight: f64 = weights.iter().sum();
             let mut rng = rand::rng();
-            tied[rng.random_range(0..tied.len())]
+            let r: f64 = rng.random_range(0.0..total_weight);
+            let mut cumulative = 0.0;
+            let mut selected = tied[0];
+            for (i, &w) in weights.iter().enumerate() {
+                cumulative += w;
+                if r < cumulative {
+                    selected = tied[i];
+                    break;
+                }
+            }
+            selected
         };
 
         info!(
