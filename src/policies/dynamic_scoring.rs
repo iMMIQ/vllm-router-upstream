@@ -154,6 +154,39 @@ impl DynamicScoringPolicy {
         local_inflight + pending
     }
 
+    /// Average loads across DP ranks of the same node.
+    /// For DP-aware URLs like "http://host:8000@0", "http://host:8000@1", etc.,
+    /// compute the average load and assign it to all ranks. Non-DP URLs pass through unchanged.
+    fn average_loads_by_node(loads: &HashMap<String, isize>) -> HashMap<String, isize> {
+        // Group by base URL
+        let mut node_loads: HashMap<String, Vec<(String, isize)>> = HashMap::new();
+        for (url, &load) in loads {
+            let base = if let Some(at_pos) = url.rfind('@') {
+                url[..at_pos].to_string()
+            } else {
+                url.clone()
+            };
+            node_loads.entry(base).or_default().push((url.clone(), load));
+        }
+
+        let mut result = HashMap::new();
+        for (_base, rank_loads) in &node_loads {
+            if rank_loads.len() <= 1 {
+                // Single rank or non-DP URL, no averaging needed
+                for (url, load) in rank_loads {
+                    result.insert(url.clone(), *load);
+                }
+            } else {
+                let sum: isize = rank_loads.iter().map(|(_, l)| *l).sum();
+                let avg = sum / rank_loads.len() as isize;
+                for (url, _) in rank_loads {
+                    result.insert(url.clone(), avg);
+                }
+            }
+        }
+        result
+    }
+
     /// Compute the score for a worker (lower is better)
     fn compute_score(&self, worker: &dyn Worker) -> f64 {
         let load = self.get_worker_load(worker);
@@ -231,8 +264,12 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
     }
 
     fn update_loads(&self, loads: &HashMap<String, isize>) {
+        // Average cached loads across ranks of the same node (base URL).
+        // This prevents intra-node rank imbalance caused by vLLM reporting
+        // slightly different loads per rank, which creates a positive feedback loop.
+        let averaged = Self::average_loads_by_node(loads);
         if let Ok(mut cached) = self.cached_loads.write() {
-            *cached = loads.clone();
+            *cached = averaged;
         }
         // Reset pending counts: the fresh cached loads already reflect
         // requests that were dispatched since the last poll.
