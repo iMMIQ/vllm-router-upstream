@@ -90,8 +90,16 @@ impl DynamicScoringPolicy {
     /// Get the safe capacity for a worker URL
     fn get_safe_capacity(&self, worker_url: &str) -> f64 {
         if let Ok(caps) = self.safe_capacities.read() {
+            // Try exact match first
             if let Some(&cap) = caps.get(worker_url) {
                 return cap;
+            }
+            // For DP-aware URLs (e.g., "http://host:8000@1"), try matching by base URL
+            if let Some(at_pos) = worker_url.rfind('@') {
+                let base_url = &worker_url[..at_pos];
+                if let Some(&cap) = caps.get(base_url) {
+                    return cap;
+                }
             }
         }
         self.default_safe_capacity
@@ -380,6 +388,32 @@ mod tests {
         assert!(counts[0] > 0, "w1 should be selected at least once");
         assert!(counts[1] > 0, "w2 should be selected at least once");
         assert!(counts[2] > 0, "w3 should be selected at least once");
+    }
+
+    #[test]
+    fn test_get_safe_capacity_dp_aware_urls() {
+        let mut caps = HashMap::new();
+        caps.insert("http://w1:8000".to_string(), 64.0);
+        caps.insert("http://w2:8000".to_string(), 256.0);
+
+        let config = DynamicScoringConfig {
+            default_safe_capacity: 100.0,
+            worker_safe_capacities: caps,
+            ..Default::default()
+        };
+        let policy = DynamicScoringPolicy::with_config(config);
+
+        // Exact match
+        assert_eq!(policy.get_safe_capacity("http://w1:8000"), 64.0);
+        assert_eq!(policy.get_safe_capacity("http://w2:8000"), 256.0);
+
+        // DP-aware URLs should resolve to base URL capacity
+        assert_eq!(policy.get_safe_capacity("http://w1:8000@0"), 64.0);
+        assert_eq!(policy.get_safe_capacity("http://w1:8000@3"), 64.0);
+        assert_eq!(policy.get_safe_capacity("http://w2:8000@1"), 256.0);
+
+        // Unknown worker still falls back to default
+        assert_eq!(policy.get_safe_capacity("http://unknown:8000@0"), 100.0);
     }
 
     #[test]
