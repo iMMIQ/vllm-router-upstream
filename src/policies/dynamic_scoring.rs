@@ -143,22 +143,6 @@ impl DynamicScoringPolicy {
         }
     }
 
-    /// Get the current effective load for a worker.
-    ///
-    /// Combines cached external load + local in-flight count + pending selections.
-    /// The pending count captures requests dispatched since the last load poll that
-    /// haven't yet entered the decode phase (still in prefill), preventing thundering herd.
-    fn get_worker_load(&self, worker: &dyn Worker) -> f64 {
-        let local_inflight = worker.load() as f64;
-        let pending = self.get_pending_count(worker.url());
-        if let Ok(loads) = self.cached_loads.read() {
-            if let Some(&cached) = loads.get(worker.url()) {
-                return cached as f64 + local_inflight + pending;
-            }
-        }
-        local_inflight + pending
-    }
-
     /// Average loads across DP ranks of the same node.
     /// For DP-aware URLs like "http://host:8000@0", "http://host:8000@1", etc.,
     /// compute the average load and assign it to all ranks. Non-DP URLs pass through unchanged.
@@ -192,11 +176,22 @@ impl DynamicScoringPolicy {
         result
     }
 
-    /// Compute the score for a worker (lower is better)
-    fn compute_score(&self, worker: &dyn Worker) -> f64 {
-        let load = self.get_worker_load(worker);
+    /// Compute the score for a worker (lower is better).
+    /// Score = α * (load / safe_cap) + pending / num_workers.
+    /// Pending is added AFTER normalization so its impact is equal across workers
+    /// with different capacities, preventing capacity bias in the tiebreaker.
+    fn compute_score(&self, worker: &dyn Worker, num_workers: usize) -> f64 {
+        let local_inflight = worker.load() as f64;
+        let cached = if let Ok(loads) = self.cached_loads.read() {
+            loads.get(worker.url()).copied().unwrap_or(0) as f64
+        } else {
+            0.0
+        };
         let safe_cap = self.get_safe_capacity(worker.url());
-        self.alpha * (load / safe_cap)
+        let pending = self.get_pending_count(worker.url());
+        let num = if num_workers > 0 { num_workers as f64 } else { 1.0 };
+
+        self.alpha * ((cached + local_inflight) / safe_cap) + pending / num
     }
 }
 
@@ -224,7 +219,7 @@ impl LoadBalancingPolicy for DynamicScoringPolicy {
         // Compute scores for all healthy workers
         let scores: Vec<(usize, f64)> = healthy_indices
             .iter()
-            .map(|&idx| (idx, self.compute_score(workers[idx].as_ref())))
+            .map(|&idx| (idx, self.compute_score(workers[idx].as_ref(), healthy_indices.len())))
             .collect();
 
         let best_score = scores.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
