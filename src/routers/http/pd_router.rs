@@ -1406,9 +1406,9 @@ impl PDRouter {
                     );
                     loads.insert(url.clone(), m.total_load());
                     gpu_cache_usage.insert(url, m.gpu_cache_usage_perc);
-                } else {
-                    loads.insert(url, 0);
                 }
+                // If fetch failed, do NOT insert 0 — let stale cached value remain.
+                // Inserting 0 makes the worker appear idle, causing a thundering herd.
             }
 
             debug!("Worker loads updated: {:?}", loads);
@@ -1787,15 +1787,24 @@ impl WorkerMetrics {
     }
 }
 
-/// Parse a Prometheus metric from text, summing all matching instances.
+/// Parse a Prometheus metric from text for a specific DP engine rank.
 ///
 /// Handles formats:
 ///   `metric_name{labels} value [timestamp]`
 ///   `metric_name value [timestamp]`
 ///
-/// When multiple instances exist (e.g., per-model or per-rank labels),
-/// their values are summed to produce the aggregate.
-fn parse_prometheus_metric(text: &str, metric_name: &str) -> Option<f64> {
+/// When `engine_rank` is Some, only the line with matching `engine="N"` label
+/// is returned. This is critical for DP-aware workers: vLLM emits per-engine
+/// labeled metrics (e.g., `vllm:num_requests_running{model_name="m",engine="0"} 42`),
+/// and we must read only the specific rank's value, not sum all ranks.
+///
+/// When `engine_rank` is None, sums all matching instances (backward compat).
+fn parse_prometheus_metric(
+    text: &str,
+    metric_name: &str,
+    engine_rank: Option<usize>,
+) -> Option<f64> {
+    let rank_label = engine_rank.map(|r| format!("engine=\"{}\"", r));
     let mut total = 0.0;
     let mut found = false;
 
@@ -1808,6 +1817,12 @@ fn parse_prometheus_metric(text: &str, metric_name: &str) -> Option<f64> {
             let rest = &line[metric_name.len()..];
             // Next char must be '{' (labels) or ' ' (value) to avoid partial name matches
             if rest.starts_with('{') || rest.starts_with(' ') {
+                // Filter by engine label if DP rank is specified
+                if let Some(ref label) = rank_label {
+                    if rest.starts_with('{') && !rest.contains(label.as_str()) {
+                        continue; // wrong engine rank, skip
+                    }
+                }
                 // Prometheus format: metric_name[{labels}] value [timestamp]
                 // Value is always the second whitespace-separated token (index 1).
                 // The optional timestamp is the third token — do NOT use parts.last().
@@ -1827,6 +1842,10 @@ fn parse_prometheus_metric(text: &str, metric_name: &str) -> Option<f64> {
 static METRICS_WARN_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Fetch worker metrics from the /metrics (Prometheus) endpoint.
+///
+/// For DP-aware workers (URL like `http://host:8000@2`), the DP rank is used
+/// to filter per-engine labeled metrics (`engine="2"`). This avoids summing
+/// all DP ranks into one inflated value.
 async fn get_worker_metrics(client: &Client, worker_url: &str) -> Option<WorkerMetrics> {
     let (base_url, dp_rank) = super::dp_utils::parse_worker_url(worker_url);
     let request = client.get(format!("{}/metrics", base_url));
@@ -1834,18 +1853,20 @@ async fn get_worker_metrics(client: &Client, worker_url: &str) -> Option<WorkerM
     match request.send().await {
         Ok(res) if res.status().is_success() => match res.text().await {
             Ok(text) => {
-                let running_opt = parse_prometheus_metric(&text, "vllm:num_requests_running");
-                let waiting_opt = parse_prometheus_metric(&text, "vllm:num_requests_waiting");
-                let gpu_cache_opt =
-                    parse_prometheus_metric(&text, "vllm:gpu_cache_usage_perc");
+                let running_opt =
+                    parse_prometheus_metric(&text, "vllm:num_requests_running", dp_rank);
+                let waiting_opt =
+                    parse_prometheus_metric(&text, "vllm:num_requests_waiting", dp_rank);
+                let kv_cache_opt =
+                    parse_prometheus_metric(&text, "vllm:kv_cache_usage_perc", dp_rank);
 
-                if running_opt.is_none() && waiting_opt.is_none() && gpu_cache_opt.is_none() {
+                if running_opt.is_none() && waiting_opt.is_none() && kv_cache_opt.is_none() {
                     // Warn once, then suppress to avoid log flooding every poll interval
                     if !METRICS_WARN_EMITTED.swap(true, AtomicOrdering::Relaxed) {
                         warn!(
                             "No vLLM metrics found from {}. Check metric names \
                              (expected vllm:num_requests_running, vllm:num_requests_waiting, \
-                             vllm:gpu_cache_usage_perc). This warning will not repeat.",
+                             vllm:kv_cache_usage_perc). This warning will not repeat.",
                             worker_url
                         );
                     }
@@ -1854,7 +1875,7 @@ async fn get_worker_metrics(client: &Client, worker_url: &str) -> Option<WorkerM
                 Some(WorkerMetrics {
                     num_requests_running: running_opt.unwrap_or(0.0) as isize,
                     num_requests_waiting: waiting_opt.unwrap_or(0.0) as isize,
-                    gpu_cache_usage_perc: gpu_cache_opt.unwrap_or(0.0),
+                    gpu_cache_usage_perc: kv_cache_opt.unwrap_or(0.0),
                 })
             }
             Err(e) => {
@@ -2920,44 +2941,94 @@ mod tests {
 # TYPE vllm:num_requests_running gauge
 vllm:num_requests_running{model_name="model"} 42.0
 "#;
-        assert_eq!(parse_prometheus_metric(text, "vllm:num_requests_running"), Some(42.0));
+        assert_eq!(
+            parse_prometheus_metric(text, "vllm:num_requests_running", None),
+            Some(42.0)
+        );
     }
 
     #[test]
     fn test_parse_prometheus_metric_no_labels() {
-        let text = "vllm:gpu_cache_usage_perc 0.75\n";
-        assert_eq!(parse_prometheus_metric(text, "vllm:gpu_cache_usage_perc"), Some(0.75));
+        let text = "vllm:kv_cache_usage_perc 0.75\n";
+        assert_eq!(
+            parse_prometheus_metric(text, "vllm:kv_cache_usage_perc", None),
+            Some(0.75)
+        );
     }
 
     #[test]
     fn test_parse_prometheus_metric_with_timestamp() {
-        // Prometheus allows optional timestamp after value — must not read it as the value
         let text = "vllm:num_requests_running{model=\"m\"} 42.0 1700000000000\n";
-        assert_eq!(parse_prometheus_metric(text, "vllm:num_requests_running"), Some(42.0));
+        assert_eq!(
+            parse_prometheus_metric(text, "vllm:num_requests_running", None),
+            Some(42.0)
+        );
     }
 
     #[test]
-    fn test_parse_prometheus_metric_sums_multiple_instances() {
-        // Multiple label sets (e.g., per-rank) should be summed
+    fn test_parse_prometheus_metric_sums_without_engine_filter() {
+        // Without engine_rank filter, sums all instances
         let text = r#"
-vllm:num_requests_running{dp_rank="0"} 10.0
-vllm:num_requests_running{dp_rank="1"} 15.0
-vllm:num_requests_running{dp_rank="2"} 12.0
-vllm:num_requests_running{dp_rank="3"} 8.0
+vllm:num_requests_running{model_name="m",engine="0"} 10.0
+vllm:num_requests_running{model_name="m",engine="1"} 15.0
+vllm:num_requests_running{model_name="m",engine="2"} 12.0
+vllm:num_requests_running{model_name="m",engine="3"} 8.0
 "#;
-        assert_eq!(parse_prometheus_metric(text, "vllm:num_requests_running"), Some(45.0));
+        assert_eq!(
+            parse_prometheus_metric(text, "vllm:num_requests_running", None),
+            Some(45.0)
+        );
+    }
+
+    #[test]
+    fn test_parse_prometheus_metric_filters_by_engine_rank() {
+        // With engine_rank, only the matching engine's value is returned
+        let text = r#"
+vllm:num_requests_running{model_name="m",engine="0"} 10.0
+vllm:num_requests_running{model_name="m",engine="1"} 15.0
+vllm:num_requests_running{model_name="m",engine="2"} 12.0
+vllm:num_requests_running{model_name="m",engine="3"} 8.0
+"#;
+        assert_eq!(
+            parse_prometheus_metric(text, "vllm:num_requests_running", Some(0)),
+            Some(10.0)
+        );
+        assert_eq!(
+            parse_prometheus_metric(text, "vllm:num_requests_running", Some(2)),
+            Some(12.0)
+        );
+        assert_eq!(
+            parse_prometheus_metric(text, "vllm:num_requests_running", Some(3)),
+            Some(8.0)
+        );
+    }
+
+    #[test]
+    fn test_parse_prometheus_metric_engine_filter_no_labels() {
+        // Single instance without engine label — engine_rank filter still matches
+        // because the line doesn't start with '{' (no labels to filter)
+        let text = "vllm:kv_cache_usage_perc 0.75\n";
+        assert_eq!(
+            parse_prometheus_metric(text, "vllm:kv_cache_usage_perc", Some(0)),
+            Some(0.75)
+        );
     }
 
     #[test]
     fn test_parse_prometheus_metric_no_partial_name_match() {
-        // "vllm:num_requests_running_extra" should NOT match "vllm:num_requests_running"
         let text = "vllm:num_requests_running_extra{} 99.0\nvllm:num_requests_running{} 42.0\n";
-        assert_eq!(parse_prometheus_metric(text, "vllm:num_requests_running"), Some(42.0));
+        assert_eq!(
+            parse_prometheus_metric(text, "vllm:num_requests_running", None),
+            Some(42.0)
+        );
     }
 
     #[test]
     fn test_parse_prometheus_metric_not_found() {
         let text = "some_other_metric 42.0\n";
-        assert_eq!(parse_prometheus_metric(text, "vllm:num_requests_running"), None);
+        assert_eq!(
+            parse_prometheus_metric(text, "vllm:num_requests_running", None),
+            None
+        );
     }
 }
