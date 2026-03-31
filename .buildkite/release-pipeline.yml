@@ -83,7 +83,7 @@ steps:
       - "dist/*.whl"
     depends_on: "version-check"
     agents:
-      queue: "arm-cpu"
+      queue: "arm64_cpu_queue_release"
 
   - wait
 
@@ -116,7 +116,7 @@ steps:
       pip install dist/*aarch64*.whl
       python -c "import vllm_router; print(vllm_router.__version__)"
     agents:
-      queue: "arm-cpu"
+      queue: "arm64_cpu_queue_release"
 
   - wait
 
