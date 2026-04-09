@@ -48,6 +48,10 @@ pub struct VllmPDRouter {
     intra_node_data_parallel_size: usize,
 }
 
+/// Transfer ID prefix used by MoRIIO to correlate prefill and decode legs.
+/// Must match `MoRIIOConstants.TRANSFER_PREFIX` in the vLLM Python connector.
+const MORIIO_TRANSFER_PREFIX: &str = "tx";
+
 impl VllmPDRouter {
     /// Generate vLLM-specific request ID with prefill/decode addressing
     fn generate_vllm_request_id(prefill_addr: &str, decode_addr: &str) -> String {
@@ -56,6 +60,68 @@ impl VllmPDRouter {
             "___prefill_addr_{}___decode_addr_{}_{}",
             prefill_addr, decode_addr, uuid
         )
+    }
+
+    /// Parse a MoRIIO-style zmq_address into its component parts.
+    ///
+    /// Supported format: `"host:IP,handshake:PORT,notify:PORT"`.
+    /// The `host:` field uses `splitn(2, ':')` so IPv4 and IPv6 addresses are
+    /// handled correctly.  Returns `(None, None, None)` for any other format
+    /// so that non-MoRIIO connectors (e.g. NixlConnector) are unaffected.
+    fn parse_moriio_zmq_address(
+        zmq_address: &str,
+    ) -> (Option<String>, Option<u16>, Option<u16>) {
+        let mut host = None;
+        let mut handshake_port = None;
+        let mut notify_port = None;
+        for part in zmq_address.split(',') {
+            // Use splitn(2) so that an IPv6 address such as "host:::1" is not
+            // split at the colons inside the address.
+            let mut kv = part.splitn(2, ':');
+            if let (Some(key), Some(val)) = (kv.next(), kv.next()) {
+                match key.trim() {
+                    "host" => host = Some(val.trim().to_string()),
+                    "handshake" => handshake_port = val.trim().parse::<u16>().ok(),
+                    "notify" => notify_port = val.trim().parse::<u16>().ok(),
+                    _ => {}
+                }
+            }
+        }
+        (host, handshake_port, notify_port)
+    }
+
+    /// Build the `kv_transfer_params` object injected into the prefill request.
+    ///
+    /// All connectors receive the four base fields (`do_remote_decode`,
+    /// `do_remote_prefill`, `remote_engine_id`, `remote_block_ids`).
+    ///
+    /// MoRIIO connectors (detected by a `"handshake:PORT"` key in the zmq_address)
+    /// additionally receive a `transfer_id` for correlating the prefill and decode
+    /// legs.  The peer's host and ports are **not** passed explicitly; instead they
+    /// are embedded in the `X-Request-Id` / `request_id` by
+    /// `generate_vllm_request_id` (format: `___prefill_addr_{zmq}___decode_addr_{zmq}_{uuid}`),
+    /// and the connector parses them from there — mirroring the approach used by
+    /// `P2pNcclConnector`.
+    fn build_prefill_kv_transfer_params(decode_zmq: &str) -> Value {
+        let mut params = json!({
+            "do_remote_decode": true,
+            "do_remote_prefill": false,
+            "remote_engine_id": Value::Null,
+            "remote_block_ids": Value::Null,
+        });
+
+        // Detect MoRIIO by the presence of a "handshake:PORT" key in the zmq_address.
+        // NixlConnector and P2pNcclConnector register plain zmq addresses without it.
+        let (_, handshake_port, _) = Self::parse_moriio_zmq_address(decode_zmq);
+        if handshake_port.is_some() {
+            params["transfer_id"] = json!(format!(
+                "{}-{}",
+                MORIIO_TRANSFER_PREFIX,
+                Uuid::new_v4().to_string().replace('-', "")
+            ));
+        }
+
+        params
     }
 
     /// Get ZMQ address for a worker URL using service discovery
@@ -368,18 +434,23 @@ impl VllmPDRouter {
         // Prepare prefill request (max_tokens=1 to force prefill-only mode)
         let mut prefill_request = Self::prepare_prefill_request(request_json.clone(), path);
 
-        // Add kv_transfer_params for NixlConnector support at top level
-        // This enables the prefill instance to prepare for remote decode
-        prefill_request["kv_transfer_params"] = json!({
-            "do_remote_decode": true,
-            "do_remote_prefill": false,
-            "remote_engine_id": serde_json::Value::Null,
-            "remote_block_ids": serde_json::Value::Null,
-            "remote_host": serde_json::Value::Null,
-            "remote_port": serde_json::Value::Null
-        });
+        // Populate kv_transfer_params for the prefill instance.  For MoRIIO the
+        // decode host/port fields are derived from its registered addresses; for
+        // other connectors (e.g. NixlConnector) those fields remain null.
+        //
+        // NOTE: This router currently implements READ-mode (sequential) scheduling
+        // only: prefill runs first and the decode request is sent after the prefill
+        // response is received.  MoRIIO WRITE mode (prefill and decode run
+        // concurrently, decode waits for a ZMQ notification) is not yet supported
+        // and will require a separate concurrent two-stage flow.
+        prefill_request["kv_transfer_params"] =
+            Self::build_prefill_kv_transfer_params(decode_zmq);
 
-        debug!("Added kv_transfer_params to prefill request for NixlConnector support");
+        debug!(
+            "Added kv_transfer_params to prefill request: {}",
+            serde_json::to_string_pretty(&prefill_request["kv_transfer_params"])
+                .unwrap_or_default()
+        );
 
         let prefill_request_str = serde_json::to_string(&prefill_request)
             .map_err(|e| format!("Failed to serialize prefill request: {}", e))?;
@@ -704,18 +775,21 @@ impl VllmPDRouter {
         // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
 
-        // Add kv_transfer_params for NixlConnector support at top level
-        // This enables the prefill instance to prepare for remote decode
-        prefill_request["kv_transfer_params"] = json!({
-            "do_remote_decode": true,
-            "do_remote_prefill": false,
-            "remote_engine_id": serde_json::Value::Null,
-            "remote_block_ids": serde_json::Value::Null,
-            "remote_host": serde_json::Value::Null,
-            "remote_port": serde_json::Value::Null
-        });
+        // NOTE: only READ-mode (sequential prefill-then-decode) scheduling is
+        // currently supported.  MoRIIO WRITE mode requires a concurrent flow and
+        // is not yet implemented here.
+        let decode_http = decode_worker
+            .base_url()
+            .replace("http://", "")
+            .replace("https://", "");
+        prefill_request["kv_transfer_params"] =
+            Self::build_prefill_kv_transfer_params(&decode_zmq_addr);
 
-        debug!("Added kv_transfer_params to prefill request for NixlConnector support");
+        debug!(
+            "Added kv_transfer_params to prefill request: {}",
+            serde_json::to_string_pretty(&prefill_request["kv_transfer_params"])
+                .unwrap_or_default()
+        );
 
         // Use endpoint_url() to get the base URL without @rank suffix,
         // avoiding IPv6+DP URL corruption (same fix as Router and PDRouter)
