@@ -769,8 +769,10 @@ impl VllmPDRouter {
         // NOTE: only READ-mode (sequential prefill-then-decode) scheduling is
         // currently supported.  MoRIIO WRITE mode requires a concurrent flow and
         // is not yet implemented here.
-        prefill_request["kv_transfer_params"] =
-            Self::build_prefill_kv_transfer_params(&decode_zmq_addr, self.intra_node_data_parallel_size);
+        prefill_request["kv_transfer_params"] = Self::build_prefill_kv_transfer_params(
+            &decode_zmq_addr,
+            self.intra_node_data_parallel_size,
+        );
 
         debug!(
             "Added kv_transfer_params to prefill request: {}",
@@ -2009,7 +2011,10 @@ mod tests {
         let moriio_zmq = "tcp://10.0.0.1:5555,handshake:6000";
         let params = VllmPDRouter::build_prefill_kv_transfer_params(moriio_zmq, 4);
         assert_eq!(params["remote_dp_size"], 4);
-        assert!(params.get("transfer_id").is_some(), "transfer_id should be set for MoRIIO");
+        assert!(
+            params.get("transfer_id").is_some(),
+            "transfer_id should be set for MoRIIO"
+        );
     }
 
     #[test]
@@ -2017,7 +2022,13 @@ mod tests {
         // Non-MoRIIO zmq address has no "handshake:" segment.
         let plain_zmq = "tcp://10.0.0.1:5555";
         let params = VllmPDRouter::build_prefill_kv_transfer_params(plain_zmq, 4);
-        assert!(params.get("remote_dp_size").is_none(), "remote_dp_size should not be set for non-MoRIIO");
-        assert!(params.get("transfer_id").is_none(), "transfer_id should not be set for non-MoRIIO");
+        assert!(
+            params.get("remote_dp_size").is_none(),
+            "remote_dp_size should not be set for non-MoRIIO"
+        );
+        assert!(
+            params.get("transfer_id").is_none(),
+            "transfer_id should not be set for non-MoRIIO"
+        );
     }
 }
