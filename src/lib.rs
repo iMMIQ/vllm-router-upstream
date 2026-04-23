@@ -103,6 +103,8 @@ struct Router {
     // OpenTelemetry tracing
     enable_trace: bool,
     otlp_traces_endpoint: Option<String>,
+    // KV connector for PD disaggregation ("nixl" or "mooncake")
+    kv_connector: String,
 }
 
 impl Router {
@@ -251,7 +253,18 @@ impl Router {
             history_backend: config::HistoryBackend::Memory,
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout
-            kv_connector: config::KvConnector::Nixl,
+            kv_connector: match self.kv_connector.to_ascii_lowercase().as_str() {
+                "nixl" => config::KvConnector::Nixl,
+                "mooncake" => config::KvConnector::Mooncake,
+                other => {
+                    return Err(config::ConfigError::ValidationFailed {
+                        reason: format!(
+                            "Invalid kv_connector '{}': expected 'nixl' or 'mooncake'",
+                            other
+                        ),
+                    });
+                }
+            },
         })
     }
 }
@@ -326,6 +339,8 @@ impl Router {
         // Tracing defaults
         enable_trace = false,
         otlp_traces_endpoint = None,
+        // KV connector default (PD disaggregation)
+        kv_connector = String::from("nixl"),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -389,6 +404,7 @@ impl Router {
         tokenizer_path: Option<String>,
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
+        kv_connector: String,
     ) -> PyResult<Self> {
         // Determine connection mode from worker URLs
         let mut all_urls = worker_urls.clone();
@@ -469,6 +485,7 @@ impl Router {
             tokenizer_path,
             enable_trace,
             otlp_traces_endpoint,
+            kv_connector,
         })
     }
 
