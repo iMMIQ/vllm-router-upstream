@@ -177,8 +177,13 @@ impl VllmPDRouter {
             }
             KvConnector::MoriIO => {
                 if matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write)) {
-                    // WRITE mode: prefill pushes blocks to decode; no do_remote_* flags needed.
+                    // WRITE mode: prefill pushes KV blocks to decode.
+                    // do_remote_decode=true tells the prefill connector to initiate the transfer.
                     json!({
+                        "do_remote_decode": true,
+                        "do_remote_prefill": false,
+                        "remote_engine_id": serde_json::Value::Null,
+                        "remote_block_ids": serde_json::Value::Null,
                         "remote_dp_size": self.intra_node_data_parallel_size,
                         "remote_tp_size": 1,
                         "transfer_id": transfer_id.unwrap_or(""),
@@ -2316,6 +2321,10 @@ mod tests {
     fn moriio_write_prefill_params(transfer_id: Option<&str>, dp_size: usize) -> Value {
         // Mirror the WRITE mode branch in build_prefill_kv_transfer_params.
         json!({
+            "do_remote_decode": true,
+            "do_remote_prefill": false,
+            "remote_engine_id": serde_json::Value::Null,
+            "remote_block_ids": serde_json::Value::Null,
             "remote_dp_size": dp_size,
             "remote_tp_size": 1,
             "transfer_id": transfer_id.unwrap_or(""),
@@ -2346,10 +2355,12 @@ mod tests {
     }
 
     #[test]
-    fn test_moriio_write_prefill_params_no_remote_decode_prefill_flags() {
+    fn test_moriio_write_prefill_params_has_do_remote_decode_true() {
         let params = moriio_write_prefill_params(Some("tx-abc"), 1);
-        assert!(params.get("do_remote_decode").is_none());
-        assert!(params.get("do_remote_prefill").is_none());
+        assert_eq!(params["do_remote_decode"], true);
+        assert_eq!(params["do_remote_prefill"], false);
+        assert!(params["remote_engine_id"].is_null());
+        assert!(params["remote_block_ids"].is_null());
         assert_eq!(params["remote_tp_size"], 1);
         assert_eq!(params["remote_dp_size"], 1);
         assert_eq!(params["transfer_id"], "tx-abc");
