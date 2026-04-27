@@ -665,25 +665,15 @@ impl VllmPDRouter {
             .map_err(|e| format!("Failed to serialize prefill request: {}", e))?;
 
         // Stage 1: dispatch prefill.
-        // WRITE mode: fire-and-forget (decode does not need the prefill response).
+        // WRITE mode: defer the prefill send until Stage 2 so we can run both concurrently
+        //   via tokio::join!, guaranteeing the prefill task always executes.
         // READ mode: await and parse — decode params come from the prefill response body.
-        let prefill_response_json: Option<Value> = if is_moriio_write {
-            let http_client = self.http_client.clone();
-            let prefill_url = format!("http://{}{}", prefill_base_http, path);
-            let prefill_request_id = request_id.clone();
-            let prefill_dp_rank_copy = prefill_dp_rank;
-            tokio::spawn(async move {
-                let mut builder = http_client
-                    .post(&prefill_url)
-                    .header("Content-Type", "application/json")
-                    .header("X-Request-Id", &prefill_request_id);
-                builder = dp_utils::add_dp_rank_header(builder, prefill_dp_rank_copy);
-                match builder.body(prefill_request_str).send().await {
-                    Ok(resp) => debug!("MoRI-IO WRITE prefill completed with status {}", resp.status()),
-                    Err(e) => warn!("MoRI-IO WRITE prefill request failed: {}", e),
-                }
-            });
-            None
+        //
+        // moriio_write_prefill_str holds the serialized prefill body in WRITE mode so it
+        // can be moved into the join! closure later (prefill_request_str is consumed here).
+        let (moriio_write_prefill_str, prefill_response_json): (Option<String>, Option<Value>) =
+        if is_moriio_write {
+            (Some(prefill_request_str), None)
         } else {
             debug!(
                 "Stage 1: Sending prefill-only request (max_tokens=1) to prefill server at http://{}",
@@ -752,8 +742,8 @@ impl VllmPDRouter {
         let prefill_json: Value = serde_json::from_str(&prefill_response_text)
             .map_err(|e| format!("Failed to parse prefill response as JSON: {}", e))?;
 
-        Some(prefill_json)
-        }; // end prefill_response_json
+        (None, Some(prefill_json))
+        }; // end (moriio_write_prefill_str, prefill_response_json)
 
         // Prepare decode request
         let mut decode_request = request_json.clone();
@@ -808,6 +798,78 @@ impl VllmPDRouter {
         }
 
         let decode_request_url = format!("http://{}{}", decode_base_http, path);
+
+        // WRITE mode: run prefill and decode concurrently via tokio::join! so the prefill
+        // task is always guaranteed to execute (unlike fire-and-forget tokio::spawn, which
+        // can be silently dropped under load) and both HTTP sends start at the same time.
+        if let Some(write_prefill_str) = moriio_write_prefill_str {
+            let http_client = self.http_client.clone();
+            let prefill_url = format!("http://{}{}", prefill_base_http, path);
+            let prefill_request_id = request_id.clone();
+            let prefill_dp_rank_copy = prefill_dp_rank;
+            let prefill_fut = async move {
+                let mut builder = http_client
+                    .post(&prefill_url)
+                    .header("Content-Type", "application/json")
+                    .header("X-Request-Id", &prefill_request_id);
+                builder = dp_utils::add_dp_rank_header(builder, prefill_dp_rank_copy);
+                match builder.body(write_prefill_str).send().await {
+                    Ok(resp) => debug!("MoRI-IO WRITE prefill completed with status {}", resp.status()),
+                    Err(e) => warn!("MoRI-IO WRITE prefill request failed: {}", e),
+                }
+            };
+            let decode_fut = otel_http::send_client_request(
+                decode_request_builder.body(decode_request_str),
+                headers,
+                ClientRequestOptions {
+                    method: "POST",
+                    url: &decode_request_url,
+                    route: Some(path),
+                    request_phase: Some("decode"),
+                },
+            );
+            let (_, decode_result) = tokio::join!(prefill_fut, decode_fut);
+            let decode_response = match decode_result {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let full_error = error_chain(&e);
+                    let duration = start_time.elapsed();
+                    RouterMetrics::record_pd_decode_error(decode_http);
+                    RouterMetrics::record_pd_request(path);
+                    RouterMetrics::record_pd_request_duration(path, duration);
+                    RouterMetrics::record_pd_prefill_request(prefill_http);
+                    return Err(format!(
+                        "Decode request failed to {}: {}",
+                        decode_http, full_error
+                    ));
+                }
+            };
+            debug!("Decode server responded with status: {}", decode_response.status());
+            // Stop profiling and record metrics then return decode response
+            self.stop_profiling(&format!("http://{}", decode_base_http)).await;
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, duration);
+            RouterMetrics::record_pd_prefill_request(prefill_http);
+            RouterMetrics::record_pd_decode_request(decode_http);
+            if !decode_response.status().is_success() {
+                RouterMetrics::record_pd_decode_error(decode_http);
+            }
+            let status = decode_response.status();
+            let resp_headers = decode_response.headers().clone();
+            let body = decode_response
+                .bytes()
+                .await
+                .map_err(|e| format!("Failed to read decode response: {}", e))?;
+            let mut response_builder = axum::http::Response::builder().status(status);
+            for (name, value) in resp_headers.iter() {
+                response_builder = response_builder.header(name, value);
+            }
+            return response_builder
+                .body(axum::body::Body::from(body))
+                .map_err(|e| format!("Failed to build response: {}", e));
+        }
+
         let decode_response = match otel_http::send_client_request(
             decode_request_builder.body(decode_request_str),
             headers,
@@ -1001,38 +1063,17 @@ impl VllmPDRouter {
             && matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write));
 
         // Stage 1: dispatch prefill.
-        // WRITE mode: fire-and-forget (decode does not need the prefill response).
+        // WRITE mode: defer the prefill send until Stage 2 so we can run both concurrently
+        //   via tokio::join!, guaranteeing the prefill task always executes.
         // READ mode: await and parse — decode params come from the prefill response body.
-        let prefill_response_json: Option<Value> = if is_moriio_write {
-            debug!("MoRI-IO WRITE mode: dispatching prefill fire-and-forget");
-            let http_client = self.pd_router.client.clone();
-            let prefill_request_clone = prefill_request.clone();
-            let prefill_request_id = request_id.clone();
-            let prefill_url_clone = prefill_url.clone();
-            let prefill_dp_rank_copy = prefill_dp_rank;
-            tokio::spawn(async move {
-                let mut builder = http_client
-                    .post(&prefill_url_clone)
-                    .header("Content-Type", "application/json")
-                    .header(
-                        "Authorization",
-                        format!(
-                            "Bearer {}",
-                            std::env::var("OPENAI_API_KEY").unwrap_or_default()
-                        ),
-                    )
-                    .header("X-Request-Id", &prefill_request_id);
-                builder = dp_utils::add_dp_rank_header(builder, prefill_dp_rank_copy);
-                match builder.json(&prefill_request_clone).send().await {
-                    Ok(resp) => debug!(
-                        "MoRI-IO WRITE prefill completed with status {}",
-                        resp.status()
-                    ),
-                    Err(e) => warn!("MoRI-IO WRITE prefill request failed: {}", e),
-                }
-            });
+        let moriio_write_prefill_request: Option<Value> = if is_moriio_write {
             prefill_worker.decrement_load();
             decode_worker.increment_load();
+            Some(prefill_request.clone())
+        } else {
+            None
+        };
+        let prefill_response_json: Option<Value> = if is_moriio_write {
             None
         } else {
             debug!(
@@ -1159,6 +1200,7 @@ impl VllmPDRouter {
         }; // end prefill_response_json
 
         // Stage 2: Prepare decode request
+        // (moriio_write_prefill_request carries the prefill body for WRITE mode join below)
         let mut decode_request = original_request.clone();
         if let Some(params) = self
             .build_decode_kv_params(
@@ -1214,30 +1256,82 @@ impl VllmPDRouter {
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
-        let decode_response = match otel_http::send_client_request(
-            decode_request_builder.json(&decode_request),
-            headers,
-            ClientRequestOptions {
-                method: "POST",
-                url: &decode_url,
-                route: Some(path),
-                request_phase: Some("decode"),
-            },
-        )
-        .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                decode_worker.decrement_load();
-                let full_error = error_chain(&e);
-                let duration = start_time.elapsed();
-                RouterMetrics::record_pd_decode_error(&decode_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, duration);
-                RouterMetrics::record_pd_prefill_request(&prefill_base_url);
-                return Err(PDRouterError::NetworkError {
-                    message: format!("Decode request failed to {}: {}", decode_url, full_error),
-                });
+        // WRITE mode: run prefill and decode concurrently via tokio::join!
+        let decode_response = if let Some(write_prefill_req) = moriio_write_prefill_request {
+            let http_client = self.pd_router.client.clone();
+            let prefill_url_clone = prefill_url.clone();
+            let prefill_request_id = request_id.clone();
+            let prefill_dp_rank_copy = prefill_dp_rank;
+            let prefill_fut = async move {
+                let mut builder = http_client
+                    .post(&prefill_url_clone)
+                    .header("Content-Type", "application/json")
+                    .header(
+                        "Authorization",
+                        format!(
+                            "Bearer {}",
+                            std::env::var("OPENAI_API_KEY").unwrap_or_default()
+                        ),
+                    )
+                    .header("X-Request-Id", &prefill_request_id);
+                builder = dp_utils::add_dp_rank_header(builder, prefill_dp_rank_copy);
+                match builder.json(&write_prefill_req).send().await {
+                    Ok(resp) => debug!("MoRI-IO WRITE prefill completed with status {}", resp.status()),
+                    Err(e) => warn!("MoRI-IO WRITE prefill request failed: {}", e),
+                }
+            };
+            let decode_fut = otel_http::send_client_request(
+                decode_request_builder.json(&decode_request),
+                headers,
+                ClientRequestOptions {
+                    method: "POST",
+                    url: &decode_url,
+                    route: Some(path),
+                    request_phase: Some("decode"),
+                },
+            );
+            let (_, decode_result) = tokio::join!(prefill_fut, decode_fut);
+            match decode_result {
+                Ok(resp) => resp,
+                Err(e) => {
+                    decode_worker.decrement_load();
+                    let full_error = error_chain(&e);
+                    let duration = start_time.elapsed();
+                    RouterMetrics::record_pd_decode_error(&decode_base_url);
+                    RouterMetrics::record_pd_request(path);
+                    RouterMetrics::record_pd_request_duration(path, duration);
+                    RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+                    return Err(PDRouterError::NetworkError {
+                        message: format!("Decode request failed to {}: {}", decode_url, full_error),
+                    });
+                }
+            }
+        } else {
+            match otel_http::send_client_request(
+                decode_request_builder.json(&decode_request),
+                headers,
+                ClientRequestOptions {
+                    method: "POST",
+                    url: &decode_url,
+                    route: Some(path),
+                    request_phase: Some("decode"),
+                },
+            )
+            .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    decode_worker.decrement_load();
+                    let full_error = error_chain(&e);
+                    let duration = start_time.elapsed();
+                    RouterMetrics::record_pd_decode_error(&decode_base_url);
+                    RouterMetrics::record_pd_request(path);
+                    RouterMetrics::record_pd_request_duration(path, duration);
+                    RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+                    return Err(PDRouterError::NetworkError {
+                        message: format!("Decode request failed to {}: {}", decode_url, full_error),
+                    });
+                }
             }
         };
 
