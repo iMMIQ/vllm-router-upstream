@@ -64,6 +64,22 @@ pub struct VllmPDRouter {
 /// Must match `MoRIIOConstants.TRANSFER_PREFIX` in the vLLM Python connector.
 const MORIIO_TRANSFER_PREFIX: &str = "tx";
 
+/// Strip the DP-rank suffix from a worker's HTTP address and return the base address
+/// plus the parsed rank. Returns `(original, None)` when DP is disabled.
+fn extract_base_http_and_dp_rank(
+    http: &str,
+    intra_node_data_parallel_size: usize,
+) -> (String, Option<usize>) {
+    if intra_node_data_parallel_size > 1 {
+        let url = format!("http://{}", http);
+        let (base, rank) = dp_utils::parse_worker_url(&url);
+        let base_http = base.replace("http://", "").replace("https://", "");
+        (base_http, rank)
+    } else {
+        (http.to_string(), None)
+    }
+}
+
 impl VllmPDRouter {
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
     /// Retries with backoff since the prefill server may not be ready at router startup.
@@ -648,25 +664,10 @@ impl VllmPDRouter {
             self.kv_connector
         );
 
-        // Extract dp_rank from prefill_http if intra_node_data_parallel_size > 1
-        let (prefill_base_http, prefill_dp_rank) = if self.intra_node_data_parallel_size > 1 {
-            let prefill_url = format!("http://{}", prefill_http);
-            let (base, rank) = dp_utils::parse_worker_url(&prefill_url);
-            let base_http = base.replace("http://", "").replace("https://", "");
-            (base_http, rank)
-        } else {
-            (prefill_http.to_string(), None)
-        };
-
-        // Extract dp_rank from decode_http if intra_node_data_parallel_size > 1
-        let (decode_base_http, decode_dp_rank) = if self.intra_node_data_parallel_size > 1 {
-            let decode_url = format!("http://{}", decode_http);
-            let (base, rank) = dp_utils::parse_worker_url(&decode_url);
-            let base_http = base.replace("http://", "").replace("https://", "");
-            (base_http, rank)
-        } else {
-            (decode_http.to_string(), None)
-        };
+        let (prefill_base_http, prefill_dp_rank) =
+            extract_base_http_and_dp_rank(prefill_http, self.intra_node_data_parallel_size);
+        let (decode_base_http, decode_dp_rank) =
+            extract_base_http_and_dp_rank(decode_http, self.intra_node_data_parallel_size);
 
         let is_moriio_write = matches!(self.kv_connector, KvConnector::MoriIO)
             && matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write));
