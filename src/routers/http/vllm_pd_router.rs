@@ -635,6 +635,7 @@ impl VllmPDRouter {
     /// Handle the decode response shared by both READ and WRITE dispatch paths.
     /// Stops decode profiling, records metrics, then routes to streaming, logprobs-merge,
     /// or plain full-body response depending on the original request.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_decode_response(
         &self,
         decode_response: reqwest::Response,

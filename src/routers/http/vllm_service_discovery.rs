@@ -446,15 +446,14 @@ mod tests {
     use super::*;
 
     fn make_moriio_msgpack(service_type: &str, transfer_mode: &str) -> Vec<u8> {
-        let mut map = rmp_serde::to_vec_named(&serde_json::json!({
+        // rmp_serde::to_vec_named produces msgpack — suitable for our deserializer.
+        rmp_serde::to_vec_named(&serde_json::json!({
             "type": service_type,
             "http_address": "1.2.3.4:8000",
             "zmq_address": "host:1.2.3.4,handshake:6301,notify:61005",
             "transfer_mode": transfer_mode,
         }))
-        .unwrap();
-        // rmp_serde::to_vec_named produces msgpack — suitable for our deserializer.
-        map
+        .unwrap()
     }
 
     #[test]
