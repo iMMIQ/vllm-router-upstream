@@ -202,7 +202,7 @@ steps:
         reason: "GPU tests can be flaky - retry if needed"
     plugins:
       - docker#v5.11.0:
-          image: "nvidia/cuda:12.9.1-devel-ubuntu22.04"
+          image: "nvidia/cuda:13.0.2-devel-ubuntu22.04"
           workdir: /workdir
           volumes:
             - ".:/workdir"
@@ -249,11 +249,24 @@ steps:
               uv venv --python 3.12 --seed
               source .venv/bin/activate
 
-              # Install vLLM with CUDA 12.8 support
-              uv pip install vllm --torch-backend=auto
+              # Install vLLM with CUDA 13 support
+              uv pip install vllm --torch-backend=cu130
 
               # Install NIXL library for P/D disaggregation
-              uv pip install nixl
+              uv pip install nixl-cu13
+              uv pip install nixl --no-deps
+
+              # Fail fast if CUDA-specific wheels do not match the CI image.
+              python - <<'PY'
+              import nixl
+              import nixl_ep
+              import torch
+              import vllm
+
+              assert torch.version.cuda and torch.version.cuda.startswith("13."), torch.version.cuda
+              assert nixl._api.__name__.startswith("nixl_cu13."), nixl._api.__name__
+              print(f"vLLM {vllm.__version__}, torch CUDA {torch.version.cuda}, {nixl._api.__name__}, {nixl_ep.__name__}")
+              PY
 
               # Install test dependencies
               uv pip install requests pytest openai

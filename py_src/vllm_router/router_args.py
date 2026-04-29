@@ -50,6 +50,8 @@ class RouterArgs:
     prefill_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     decode_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     bootstrap_port_annotation: str = "vllm.ai/bootstrap-port"
+    # KV connector for PD disaggregation (nixl pull-based or mooncake push-based)
+    kv_connector: str = "nixl"
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
@@ -315,6 +317,15 @@ class RouterArgs:
             nargs="+",
             default={},
             help="Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-connector",
+            type=str,
+            default=RouterArgs.kv_connector,
+            choices=["nixl", "mooncake"],
+            help="KV connector type for PD disaggregation. 'nixl' (default) uses NIXL's "
+            "pull-based KV transfer; 'mooncake' uses Mooncake's push-based protocol "
+            "(queries each prefill node's bootstrap server for engine_id per DP rank).",
         )
         # Prometheus configuration
         parser.add_argument(

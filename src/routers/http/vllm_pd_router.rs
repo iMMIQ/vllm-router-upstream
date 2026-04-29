@@ -5,6 +5,7 @@ use super::logprobs_merge;
 use super::pd_router::PDRouter;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
+use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
@@ -24,6 +25,13 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+/// Mooncake prefill bootstrap info (engine_id per dp_rank)
+#[derive(Debug, Clone)]
+struct MooncakePrefillInfo {
+    bootstrap_addr: String,
+    dp_engine_ids: HashMap<usize, String>,
+}
 
 /// vLLM PD Router that extends PDRouter with vLLM-specific request handling
 #[derive(Debug)]
@@ -46,9 +54,149 @@ pub struct VllmPDRouter {
     profiling_tasks: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
     /// Intra-node data parallel size for DP-aware routing (automatically enabled when > 1)
     intra_node_data_parallel_size: usize,
+    /// KV connector type
+    kv_connector: KvConnector,
+    /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
+    mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
 }
 
 impl VllmPDRouter {
+    /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
+    /// Retries with backoff since the prefill server may not be ready at router startup.
+    async fn query_mooncake_bootstrap(
+        client: &reqwest::Client,
+        bootstrap_addr: &str,
+    ) -> Result<HashMap<usize, String>, String> {
+        let url = format!("{}/query", bootstrap_addr);
+        let max_retries = 30;
+        let mut backoff_secs = 1u64;
+
+        for attempt in 1..=max_retries {
+            match client.get(&url).send().await {
+                Ok(response) => {
+                    if !response.status().is_success() {
+                        if attempt == max_retries {
+                            return Err(format!(
+                                "Mooncake bootstrap query to {} failed with status {}",
+                                url,
+                                response.status()
+                            ));
+                        }
+                        warn!(
+                            "Mooncake bootstrap query attempt {}/{} to {} returned {}, retrying in {}s",
+                            attempt, max_retries, url, response.status(), backoff_secs
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(10);
+                        continue;
+                    }
+                    let data: Value = response
+                        .json()
+                        .await
+                        .map_err(|e| format!("Failed to parse bootstrap response: {}", e))?;
+
+                    let mut dp_engine_ids = HashMap::new();
+                    if let Some(obj) = data.as_object() {
+                        for (dp_rank_str, dp_entry) in obj {
+                            let dp_rank: usize = dp_rank_str
+                                .parse()
+                                .map_err(|e| format!("Invalid dp_rank '{}': {}", dp_rank_str, e))?;
+                            let engine_id = dp_entry
+                                .get("engine_id")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| {
+                                    format!("Missing engine_id for dp_rank {}", dp_rank)
+                                })?
+                                .to_string();
+                            dp_engine_ids.insert(dp_rank, engine_id);
+                        }
+                    }
+                    info!(
+                        "Queried Mooncake bootstrap at {}: {} dp ranks found",
+                        url,
+                        dp_engine_ids.len()
+                    );
+                    return Ok(dp_engine_ids);
+                }
+                Err(e) => {
+                    if attempt == max_retries {
+                        return Err(format!(
+                            "Mooncake bootstrap query to {} failed after {} attempts: {}",
+                            url, max_retries, e
+                        ));
+                    }
+                    warn!(
+                        "Mooncake bootstrap query attempt {}/{} to {} failed: {}, retrying in {}s",
+                        attempt, max_retries, url, e, backoff_secs
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(10);
+                }
+            }
+        }
+        Err(format!(
+            "Mooncake bootstrap query to {} failed after {} attempts",
+            url, max_retries
+        ))
+    }
+
+    /// Build kv_transfer_params for the prefill request
+    fn build_prefill_kv_transfer_params(&self, transfer_id: Option<&str>) -> Value {
+        if matches!(self.kv_connector, KvConnector::Mooncake) {
+            json!({
+                "do_remote_decode": true,
+                "do_remote_prefill": false,
+                "transfer_id": transfer_id.unwrap_or(""),
+            })
+        } else {
+            json!({
+                "do_remote_decode": true,
+                "do_remote_prefill": false,
+                "remote_engine_id": serde_json::Value::Null,
+                "remote_block_ids": serde_json::Value::Null,
+                "remote_host": serde_json::Value::Null,
+                "remote_port": serde_json::Value::Null
+            })
+        }
+    }
+
+    /// Build kv_transfer_params for the decode request (Mooncake only).
+    /// For NIXL, decode params come from the prefill response instead.
+    fn build_mooncake_decode_kv_transfer_params(
+        &self,
+        transfer_id: &str,
+        bootstrap_addr: &str,
+        engine_id: &str,
+    ) -> Value {
+        json!({
+            "do_remote_decode": false,
+            "do_remote_prefill": true,
+            "transfer_id": transfer_id,
+            "remote_bootstrap_addr": bootstrap_addr,
+            "remote_engine_id": engine_id,
+        })
+    }
+
+    /// Look up Mooncake prefill info for a given prefill URL and dp_rank
+    async fn get_mooncake_info(
+        &self,
+        prefill_url: &str,
+        dp_rank: Option<usize>,
+    ) -> Option<(String, String)> {
+        let info = self.mooncake_prefill_info.lock().await;
+        if let Some(prefill_info) = info.get(prefill_url) {
+            let rank = dp_rank.unwrap_or(0);
+            if let Some(engine_id) = prefill_info.dp_engine_ids.get(&rank) {
+                return Some((prefill_info.bootstrap_addr.clone(), engine_id.clone()));
+            }
+            // Fallback: use first available engine_id
+            if let Some(engine_id) = prefill_info.dp_engine_ids.values().next() {
+                return Some((prefill_info.bootstrap_addr.clone(), engine_id.clone()));
+            }
+        }
+        None
+    }
+
     /// Generate vLLM-specific request ID with prefill/decode addressing
     fn generate_vllm_request_id(prefill_addr: &str, decode_addr: &str) -> String {
         let uuid = Uuid::new_v4().to_string().replace('-', "");
@@ -368,18 +516,22 @@ impl VllmPDRouter {
         // Prepare prefill request (max_tokens=1 to force prefill-only mode)
         let mut prefill_request = Self::prepare_prefill_request(request_json.clone(), path);
 
-        // Add kv_transfer_params for NixlConnector support at top level
-        // This enables the prefill instance to prepare for remote decode
-        prefill_request["kv_transfer_params"] = json!({
-            "do_remote_decode": true,
-            "do_remote_prefill": false,
-            "remote_engine_id": serde_json::Value::Null,
-            "remote_block_ids": serde_json::Value::Null,
-            "remote_host": serde_json::Value::Null,
-            "remote_port": serde_json::Value::Null
-        });
+        // Generate transfer_id for Mooncake (unused for NIXL)
+        let transfer_id = format!("xfer-{}", Uuid::new_v4());
+        let transfer_id_ref: Option<&str> = if matches!(self.kv_connector, KvConnector::Mooncake) {
+            Some(&transfer_id)
+        } else {
+            None
+        };
 
-        debug!("Added kv_transfer_params to prefill request for NixlConnector support");
+        // Add kv_transfer_params for KV connector support at top level
+        prefill_request["kv_transfer_params"] =
+            self.build_prefill_kv_transfer_params(transfer_id_ref);
+
+        debug!(
+            "Added kv_transfer_params to prefill request for {:?} connector",
+            self.kv_connector
+        );
 
         let prefill_request_str = serde_json::to_string(&prefill_request)
             .map_err(|e| format!("Failed to serialize prefill request: {}", e))?;
@@ -490,9 +642,43 @@ impl VllmPDRouter {
 
         // Prepare decode request with kv_transfer_params from prefill response at top level
         let mut decode_request = request_json.clone();
-        if let Some(params) = kv_transfer_params {
-            decode_request["kv_transfer_params"] = params;
-            debug!("Added kv_transfer_params to decode request");
+        if matches!(self.kv_connector, KvConnector::Mooncake) {
+            // Mooncake: set decode params proactively from bootstrap info
+            let prefill_url_key = format!("http://{}", prefill_base_http);
+            if let Some((bootstrap_addr, engine_id)) = self
+                .get_mooncake_info(&prefill_url_key, prefill_dp_rank)
+                .await
+            {
+                decode_request["kv_transfer_params"] = self
+                    .build_mooncake_decode_kv_transfer_params(
+                        &transfer_id,
+                        &bootstrap_addr,
+                        &engine_id,
+                    );
+                debug!(
+                    "Set Mooncake decode kv_transfer_params with bootstrap_addr={}, engine_id={}",
+                    bootstrap_addr, engine_id
+                );
+            } else {
+                warn!(
+                    "No Mooncake bootstrap info for prefill {}, decode will proceed without kv_transfer_params",
+                    prefill_url_key
+                );
+            }
+        } else {
+            // NIXL: extract kv_transfer_params from prefill response
+            let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
+            if let Some(ref params) = kv_transfer_params {
+                debug!(
+                    "Extracted kv_transfer_params from prefill response: {}",
+                    serde_json::to_string_pretty(params).unwrap_or_default()
+                );
+            } else {
+                debug!("No kv_transfer_params found in prefill response");
+            }
+            if let Some(params) = kv_transfer_params {
+                decode_request["kv_transfer_params"] = params;
+            }
         }
 
         let decode_request_str = serde_json::to_string(&decode_request)
@@ -733,18 +919,22 @@ impl VllmPDRouter {
         // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
 
-        // Add kv_transfer_params for NixlConnector support at top level
-        // This enables the prefill instance to prepare for remote decode
-        prefill_request["kv_transfer_params"] = json!({
-            "do_remote_decode": true,
-            "do_remote_prefill": false,
-            "remote_engine_id": serde_json::Value::Null,
-            "remote_block_ids": serde_json::Value::Null,
-            "remote_host": serde_json::Value::Null,
-            "remote_port": serde_json::Value::Null
-        });
+        // Generate transfer_id for Mooncake (unused for NIXL)
+        let transfer_id = format!("xfer-{}", Uuid::new_v4());
+        let transfer_id_ref: Option<&str> = if matches!(self.kv_connector, KvConnector::Mooncake) {
+            Some(&transfer_id)
+        } else {
+            None
+        };
 
-        debug!("Added kv_transfer_params to prefill request for NixlConnector support");
+        // Add kv_transfer_params for KV connector support at top level
+        prefill_request["kv_transfer_params"] =
+            self.build_prefill_kv_transfer_params(transfer_id_ref);
+
+        debug!(
+            "Added kv_transfer_params to prefill request for {:?} connector",
+            self.kv_connector
+        );
 
         // Use endpoint_url() to get the base URL without @rank suffix,
         // avoiding IPv6+DP URL corruption (same fix as Router and PDRouter)
@@ -888,11 +1078,44 @@ impl VllmPDRouter {
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
-        // Stage 2: Prepare decode request with kv_transfer_params from prefill response at top level
+        // Stage 2: Prepare decode request with kv_transfer_params
         let mut decode_request = original_request.clone();
-        if let Some(params) = kv_transfer_params {
-            decode_request["kv_transfer_params"] = params;
-            debug!("Added kv_transfer_params to decode request");
+        if matches!(self.kv_connector, KvConnector::Mooncake) {
+            // Mooncake: set decode params proactively from bootstrap info
+            if let Some((bootstrap_addr, engine_id)) = self
+                .get_mooncake_info(&prefill_base_url, prefill_dp_rank)
+                .await
+            {
+                decode_request["kv_transfer_params"] = self
+                    .build_mooncake_decode_kv_transfer_params(
+                        &transfer_id,
+                        &bootstrap_addr,
+                        &engine_id,
+                    );
+                debug!(
+                    "Set Mooncake decode kv_transfer_params with bootstrap_addr={}, engine_id={}",
+                    bootstrap_addr, engine_id
+                );
+            } else {
+                warn!(
+                    "No Mooncake bootstrap info for prefill {}, decode will proceed without kv_transfer_params",
+                    prefill_base_url
+                );
+            }
+        } else {
+            // NIXL: extract kv_transfer_params from prefill response
+            let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
+            if let Some(ref params) = kv_transfer_params {
+                debug!(
+                    "Extracted kv_transfer_params from prefill response: {}",
+                    serde_json::to_string_pretty(params).unwrap_or_default()
+                );
+            } else {
+                debug!("No kv_transfer_params found in prefill response");
+            }
+            if let Some(params) = kv_transfer_params {
+                decode_request["kv_transfer_params"] = params;
+            }
         }
 
         // Use endpoint_url() to get the base URL without @rank suffix,
@@ -1082,6 +1305,9 @@ impl VllmPDRouter {
         discovery_address: Option<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        let kv_connector = ctx.router_config.kv_connector;
+        let http_client = reqwest::Client::new();
+
         if let Some(ref addr) = discovery_address {
             // Discovery mode
             info!(
@@ -1101,18 +1327,23 @@ impl VllmPDRouter {
                 .await
                 .map_err(|e| format!("Failed to start service discovery: {}", e))?;
 
-            info!("VllmPDRouter created successfully with pure service discovery");
+            info!(
+                "VllmPDRouter created successfully with pure service discovery, kv_connector={:?}",
+                kv_connector
+            );
 
             Ok(Self {
                 pd_router,
                 service_registry: Arc::new(service_registry),
-                http_client: reqwest::Client::new(),
+                http_client,
                 policy_registry: ctx.policy_registry.clone(),
                 use_discovery: true,
                 enable_profiling: ctx.router_config.enable_profiling,
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
+                kv_connector,
+                mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
             })
         } else {
             // Direct URL mode (same as PDRouter)
@@ -1123,7 +1354,7 @@ impl VllmPDRouter {
             );
 
             // Create underlying PD router with provided worker lists
-            let pd_router = PDRouter::new(prefill_urls, decode_urls, ctx).await?;
+            let pd_router = PDRouter::new(prefill_urls.clone(), decode_urls, ctx).await?;
 
             // No service discovery in direct URL mode
             let service_registry = ServiceRegistry::new();
@@ -1145,16 +1376,62 @@ impl VllmPDRouter {
             }
             info!("Initializing prefill and decode policies with workers.");
 
+            // Query Mooncake bootstrap servers if kv_connector is mooncake
+            let mooncake_prefill_info = Arc::new(Mutex::new(HashMap::new()));
+            if matches!(kv_connector, KvConnector::Mooncake) {
+                info!("Mooncake connector enabled, querying prefill bootstrap servers...");
+                for (url, bootstrap_port) in &prefill_urls {
+                    let parsed = url::Url::parse(url)
+                        .map_err(|e| format!("Invalid prefill URL '{}': {}", url, e))?;
+                    let host = parsed.host_str().unwrap_or("127.0.0.1");
+                    let port = bootstrap_port.unwrap_or(8998);
+                    let bootstrap_addr = format!("http://{}:{}", host, port);
+                    let base_url = format!(
+                        "{}://{}:{}",
+                        parsed.scheme(),
+                        host,
+                        parsed.port().unwrap_or(8000)
+                    );
+
+                    info!(
+                        "Querying Mooncake bootstrap at {} for prefill {}",
+                        bootstrap_addr, base_url
+                    );
+                    match Self::query_mooncake_bootstrap(&http_client, &bootstrap_addr).await {
+                        Ok(dp_engine_ids) => {
+                            info!(
+                                "Got Mooncake engine_ids for {}: {:?}",
+                                base_url, dp_engine_ids
+                            );
+                            mooncake_prefill_info.lock().await.insert(
+                                base_url,
+                                MooncakePrefillInfo {
+                                    bootstrap_addr,
+                                    dp_engine_ids,
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            error!("Failed to query Mooncake bootstrap for {}: {}", base_url, e);
+                            return Err(e);
+                        }
+                    }
+                }
+                info!("Mooncake bootstrap query complete for all prefill nodes");
+            }
+
             Ok(Self {
                 pd_router,
                 service_registry: Arc::new(service_registry),
-                http_client: reqwest::Client::new(),
+                http_client,
                 policy_registry: ctx.policy_registry.clone(),
                 use_discovery: false,
                 enable_profiling: ctx.router_config.enable_profiling,
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
+                kv_connector,
+                mooncake_prefill_info,
             })
         }
     }

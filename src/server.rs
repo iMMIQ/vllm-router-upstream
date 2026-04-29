@@ -854,11 +854,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     println!("DEBUG: Prometheus metrics initialized");
 
     info!(
-        "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
+        "Starting router on {}:{} | mode: {:?} | policy: {:?} | kv_connector: {:?} | max_payload: {}MB",
         config.host,
         config.port,
         config.router_config.mode,
         config.router_config.policy,
+        config.router_config.kv_connector,
         config.max_payload_size / (1024 * 1024)
     );
 
