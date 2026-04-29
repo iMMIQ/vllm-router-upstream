@@ -1,5 +1,6 @@
 // vLLM Service Discovery Implementation
-// This module implements service discovery for vLLM P2P NCCL coordination
+// This module implements service discovery for vLLM P2P NCCL and MoRI-IO
+// connector coordination
 
 use crate::config::KvConnector;
 use serde::{Deserialize, Serialize};
