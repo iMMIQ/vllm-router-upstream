@@ -5,7 +5,7 @@ use futures;
 use serde_json;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -151,6 +151,14 @@ pub trait Worker: Send + Sync + fmt::Debug {
         true
     }
 
+    /// Get the current health check configuration.
+    fn health_config(&self) -> HealthConfig {
+        self.metadata().health_config.clone()
+    }
+
+    /// Update the health check configuration without recreating the worker.
+    fn update_health_config(&self, _config: HealthConfig) {}
+
     // === Multi-router support ===
 
     // TODO: - Enhanced Worker Discovery
@@ -284,6 +292,7 @@ pub struct WorkerMetadata {
 #[derive(Clone)]
 pub struct BasicWorker {
     metadata: WorkerMetadata,
+    health_config: Arc<RwLock<HealthConfig>>,
     load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
@@ -322,6 +331,7 @@ impl BasicWorker {
 
         Self {
             metadata,
+            health_config: Arc::new(RwLock::new(HealthConfig::default())),
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
@@ -337,7 +347,8 @@ impl BasicWorker {
     }
 
     pub fn with_health_config(mut self, config: HealthConfig) -> Self {
-        self.metadata.health_config = config;
+        self.metadata.health_config = config.clone();
+        *self.health_config.write().unwrap() = config;
         self
     }
 
@@ -398,8 +409,9 @@ impl Worker for BasicWorker {
             ConnectionMode::Http => {
                 // Perform HTTP health check
                 let url = self.normalised_url()?;
-                let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
-                let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+                let health_config = self.health_config.read().unwrap().clone();
+                let health_url = format!("{}{}", url, health_config.endpoint);
+                let timeout = Duration::from_secs(health_config.timeout_secs);
 
                 // Use the shared client with a custom timeout for this request
                 match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
@@ -416,7 +428,7 @@ impl Worker for BasicWorker {
 
             // Mark healthy if we've reached the success threshold
             if !self.is_healthy()
-                && successes >= self.metadata.health_config.success_threshold as usize
+                && successes >= self.health_config.read().unwrap().success_threshold as usize
             {
                 self.set_healthy(true);
                 self.consecutive_successes.store(0, Ordering::Release);
@@ -429,7 +441,7 @@ impl Worker for BasicWorker {
 
             // Mark unhealthy if we've reached the failure threshold
             if self.is_healthy()
-                && failures >= self.metadata.health_config.failure_threshold as usize
+                && failures >= self.health_config.read().unwrap().failure_threshold as usize
             {
                 self.set_healthy(false);
                 self.consecutive_failures.store(0, Ordering::Release);
@@ -476,6 +488,14 @@ impl Worker for BasicWorker {
 
     fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
+    }
+
+    fn health_config(&self) -> HealthConfig {
+        self.health_config.read().unwrap().clone()
+    }
+
+    fn update_health_config(&self, config: HealthConfig) {
+        *self.health_config.write().unwrap() = config;
     }
 }
 
@@ -577,6 +597,14 @@ impl Worker for DPAwareWorker {
 
     fn circuit_breaker(&self) -> &CircuitBreaker {
         self.base_worker.circuit_breaker()
+    }
+
+    fn health_config(&self) -> HealthConfig {
+        self.base_worker.health_config()
+    }
+
+    fn update_health_config(&self, config: HealthConfig) {
+        self.base_worker.update_health_config(config);
     }
 
     // DP-aware specific implementations

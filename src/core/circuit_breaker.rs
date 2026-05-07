@@ -58,7 +58,7 @@ pub struct CircuitBreaker {
     total_successes: Arc<AtomicU64>,
     last_failure_time: Arc<RwLock<Option<Instant>>>,
     last_state_change: Arc<RwLock<Instant>>,
-    config: CircuitBreakerConfig,
+    config: Arc<RwLock<CircuitBreakerConfig>>,
 }
 
 impl CircuitBreaker {
@@ -77,7 +77,7 @@ impl CircuitBreaker {
             total_successes: Arc::new(AtomicU64::new(0)),
             last_failure_time: Arc::new(RwLock::new(None)),
             last_state_change: Arc::new(RwLock::new(Instant::now())),
-            config,
+            config: Arc::new(RwLock::new(config)),
         }
     }
 
@@ -117,11 +117,12 @@ impl CircuitBreaker {
         // Outcome-level metrics are recorded at the worker level where the worker label is known
 
         let current_state = *self.state.read().unwrap();
+        let config = self.config.read().unwrap().clone();
 
         match current_state {
             CircuitState::HalfOpen => {
                 // Check if we've reached the success threshold to close the circuit
-                if successes >= self.config.success_threshold {
+                if successes >= config.success_threshold {
                     self.transition_to(CircuitState::Closed);
                 }
             }
@@ -149,11 +150,12 @@ impl CircuitBreaker {
         }
 
         let current_state = *self.state.read().unwrap();
+        let config = self.config.read().unwrap().clone();
 
         match current_state {
             CircuitState::Closed => {
                 // Check if we've reached the failure threshold to open the circuit
-                if failures >= self.config.failure_threshold {
+                if failures >= config.failure_threshold {
                     self.transition_to(CircuitState::Open);
                 }
             }
@@ -174,7 +176,7 @@ impl CircuitBreaker {
         if current_state == CircuitState::Open {
             // Check if timeout has expired
             let last_change = *self.last_state_change.read().unwrap();
-            if last_change.elapsed() >= self.config.timeout_duration {
+            if last_change.elapsed() >= self.config.read().unwrap().timeout_duration {
                 self.transition_to(CircuitState::HalfOpen);
             }
         }
@@ -283,6 +285,16 @@ impl CircuitBreaker {
         self.transition_to(CircuitState::Open);
     }
 
+    /// Get the current circuit breaker configuration.
+    pub fn config(&self) -> CircuitBreakerConfig {
+        self.config.read().unwrap().clone()
+    }
+
+    /// Update the circuit breaker configuration without resetting state.
+    pub fn update_config(&self, config: CircuitBreakerConfig) {
+        *self.config.write().unwrap() = config;
+    }
+
     /// Get circuit breaker statistics
     pub fn stats(&self) -> CircuitBreakerStats {
         CircuitBreakerStats {
@@ -293,6 +305,7 @@ impl CircuitBreaker {
             total_successes: self.total_successes(),
             time_since_last_failure: self.time_since_last_failure(),
             time_since_last_state_change: self.time_since_last_state_change(),
+            config: self.config(),
         }
     }
 }
@@ -307,7 +320,7 @@ impl Clone for CircuitBreaker {
             total_successes: Arc::clone(&self.total_successes),
             last_failure_time: Arc::clone(&self.last_failure_time),
             last_state_change: Arc::clone(&self.last_state_change),
-            config: self.config.clone(),
+            config: Arc::clone(&self.config),
         }
     }
 }
@@ -328,6 +341,7 @@ pub struct CircuitBreakerStats {
     pub total_successes: u64,
     pub time_since_last_failure: Option<Duration>,
     pub time_since_last_state_change: Duration,
+    pub config: CircuitBreakerConfig,
 }
 
 #[cfg(test)]

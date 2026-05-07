@@ -30,13 +30,20 @@ pub struct ConsistentHashPolicy {
     hash_ring: RwLock<BTreeMap<u64, String>>,
     /// Current set of workers (for detecting changes)
     current_workers: RwLock<Vec<String>>,
+    /// Number of virtual nodes per physical worker.
+    virtual_nodes: u32,
 }
 
 impl ConsistentHashPolicy {
     pub fn new() -> Self {
+        Self::with_virtual_nodes(VIRTUAL_NODES_PER_WORKER)
+    }
+
+    pub fn with_virtual_nodes(virtual_nodes: u32) -> Self {
         Self {
             hash_ring: RwLock::new(BTreeMap::new()),
             current_workers: RwLock::new(Vec::new()),
+            virtual_nodes: virtual_nodes.max(1),
         }
     }
 
@@ -262,7 +269,7 @@ impl ConsistentHashPolicy {
 
         for worker_url in &worker_urls {
             // Create virtual nodes for better distribution
-            for i in 0..VIRTUAL_NODES_PER_WORKER {
+            for i in 0..self.virtual_nodes {
                 let virtual_key = format!("{}:{}", worker_url, i);
                 let hash_value = Self::fbi_hash(&virtual_key);
                 new_ring.insert(hash_value, worker_url.clone());
@@ -282,7 +289,7 @@ impl ConsistentHashPolicy {
         info!(
             "Updated consistent hash ring with {} workers and {} virtual nodes",
             workers.len(),
-            workers.len() as u32 * VIRTUAL_NODES_PER_WORKER
+            workers.len() as u32 * self.virtual_nodes
         );
     }
 
