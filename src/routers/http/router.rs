@@ -1199,12 +1199,13 @@ impl Router {
             }
         } else {
             // Get the worker first to extract model_id
-            let model_id = if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                worker.model_id().to_string()
-            } else {
-                warn!("Worker {} not found, skipping removal", worker_url);
-                return;
-            };
+            let (model_id, worker_url_owned) =
+                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                    (worker.model_id().to_string(), worker.url().to_string())
+                } else {
+                    warn!("Worker {} not found, skipping removal", worker_url);
+                    return;
+                };
 
             if self.worker_registry.remove_by_url(worker_url).is_some() {
                 info!("Removed worker: {}", worker_url);
@@ -1221,8 +1222,8 @@ impl Router {
                     .as_any()
                     .downcast_ref::<crate::policies::CacheAwarePolicy>()
                 {
-                    cache_aware.remove_worker_by_url(worker_url);
-                    info!("Removed worker from cache-aware tree: {}", worker_url);
+                    cache_aware.remove_worker_by_url(&worker_url_owned);
+                    info!("Removed worker from cache-aware tree: {}", worker_url_owned);
                 }
             }
         }
