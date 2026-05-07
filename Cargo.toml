@@ -72,7 +72,7 @@ rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",
 ] }
-hf-hub = { version = "0.4.3", features = ["tokio"] }
+hf-hub = { version = "0.4.3", default-features = false, features = ["tokio", "rustls-tls"] }
 
 deadpool = { version = "0.12", features = ["managed", "rt_tokio_1"] }
 backoff = { version = "0.4", features = ["tokio"] }
